@@ -62,6 +62,17 @@ data/preheat.json):
   GET  /api/preheat/queue           (order / limit reasons / ETA — same as CLI)
   POST /api/preheat/tick            {seconds}  (advance the simulated clock)
   GET  /api/preheat/events
+
+Box-side acceptance, quarantine and repair (同一 preheat 存储):
+  POST /api/preheat/tasks/{id}/accept      (verify length/chunk hash/root hash;
+                                            immutable proof, or isolate + one repair)
+  POST /api/preheat/tasks/{id}/damage      {missing_chunks, corrupt_chunks}
+  GET  /api/preheat/acceptances[?box=&manifest=&job=]
+  GET  /api/preheat/acceptances/{id}
+  GET  /api/preheat/repairs[?box=&job=]  · /api/preheat/repairs/{id}
+  POST /api/preheat/repairs/{id}/cancel
+  GET  /api/preheat/switchable[?box=]
+  GET  /api/preheat/acceptance-summary?group_by=site|manifest[&site=&manifest=]
 Static UI served at /
 """
 
@@ -283,6 +294,18 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/preheat/tick":
             return self._send_json(PREHEAT.tick(body.get("seconds", 1)))
 
+        # -------- box-side acceptance / quarantine / repair --------------
+        m = re.match(r"^/api/preheat/tasks/([^/]+)/accept$", path)
+        if m:
+            return self._send_json(PREHEAT.accept_task(m.group(1), body))
+        m = re.match(r"^/api/preheat/tasks/([^/]+)/damage$", path)
+        if m:
+            return self._send_json(PREHEAT.inject_damage(m.group(1), body))
+        m = re.match(r"^/api/preheat/repairs/([^/]+)/cancel$", path)
+        if m:
+            r = PREHEAT.cancel_repair(m.group(1), body.get("by", "box-agent"))
+            return self._send_json(r, 200 if r.get("idempotent") else 201)
+
         table = {
             "/api/candidates": lambda: self._send_json(ENGINE.list_candidates()),
             "/api/patches": lambda: self._send_json(ENGINE.create_patch(body)),
@@ -378,6 +401,26 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/preheat/events":
             return self._send_json({"events": PREHEAT.list_events(
                 int(q.get("limit", ["80"])[0]))})
+        if path == "/api/preheat/acceptances":
+            return self._send_json({"acceptances": PREHEAT.list_acceptances(
+                q.get("box", [None])[0], q.get("manifest", [None])[0],
+                q.get("job", [None])[0], int(q.get("limit", ["200"])[0]))})
+        m = re.match(r"^/api/preheat/acceptances/([^/]+)$", path)
+        if m:
+            return self._send_json(PREHEAT.get_acceptance(m.group(1)))
+        if path == "/api/preheat/repairs":
+            return self._send_json({"repairs": PREHEAT.list_repairs(
+                q.get("box", [None])[0], q.get("job", [None])[0])})
+        m = re.match(r"^/api/preheat/repairs/([^/]+)$", path)
+        if m:
+            return self._send_json(PREHEAT.get_repair(m.group(1)))
+        if path == "/api/preheat/switchable":
+            return self._send_json(PREHEAT.list_switchable(
+                q.get("box", [None])[0]))
+        if path == "/api/preheat/acceptance-summary":
+            return self._send_json(PREHEAT.acceptance_summary(
+                q.get("group_by", ["site"])[0],
+                q.get("site", [None])[0], q.get("manifest", [None])[0]))
 
         table = {
             "/api/status": lambda: self._send_json(ENGINE.region_status()),

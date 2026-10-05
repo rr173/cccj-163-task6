@@ -55,6 +55,33 @@ def expect_err(name, fn, code, status):
     return None
 
 
+def settle(eng, ticks=120):
+    """Drive every transfer to done, then run box-side acceptance; follow
+    repairs until proofs (only proven content becomes reusable)."""
+    for _ in range(ticks):
+        eng.tick(1)
+        if not any(t["status"] in ("queued", "transferring")
+                   for t in eng.state["tasks"].values()):
+            break
+    # acceptance pass: primaries first, repairs may appear as they converge
+    for _ in range(20):
+        pending = [tid for tid, t in eng.state["tasks"].items()
+                   if t["status"] == "done"
+                   and t["accept_state"] == "pending"]
+        if not pending:
+            break
+        for tid in pending:
+            res = eng.accept_task(tid)
+            rid = (res.get("repair") or {}).get("repair_id")
+            if rid:
+                rtid = eng.state["repairs"][rid]["task_id"]
+                for _ in range(ticks):
+                    eng.tick(1)
+                    if eng.state["tasks"][rtid]["status"] == "done":
+                        break
+                eng.accept_task(rtid)
+
+
 def live_fp(eng):
     s = eng.state
     return json.dumps({"gen": s["region_gen"], "heads": s["region_heads"],
@@ -244,11 +271,8 @@ def main():
           all(done_map.get(tid, -1) == done for tid, (done, _) in snap.items()))
     ph = ph2
 
-    print("\n[8] 内容复用：已完成 gen1 的盒子对 gen2 只传增量")
-    for _ in range(60):
-        ph.tick(1.0)
-        if not ph.queue()["queue"]:
-            break
+    print("\n[8] 内容复用：已完成 gen1 的盒子对 gen2 只传增量（仅已证明内容可复用）")
+    settle(ph)
     j5 = ph.create_job({"manifest_id": m2["manifest_id"],
                         "targets": ["RSU-01", "RSU-03"],
                         "deadline_in_sec": 600, "link_cap_kbps": 1.0,
@@ -267,10 +291,7 @@ def main():
     check("不变量自检通过", ph.check_invariants() == [])
 
     print("\n[9] 修改配额：确定性抢占；取消：判定一次终身")
-    for _ in range(60):
-        ph.tick(1.0)
-        if not ph.queue()["queue"]:
-            break
+    settle(ph)
     j7 = ph.create_job({"manifest_id": m2["manifest_id"], "targets": ["RSU-03"],
                         "deadline_in_sec": 600, "link_cap_kbps": 5.0,
                         "min_online": 1})

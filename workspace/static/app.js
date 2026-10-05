@@ -12,6 +12,7 @@ const state = {
   fullSnapshot: null,
   audit: { imports: [], selected: null, state: null, branch: null,
            options: null, map: null, querying: false, mode: "state" },
+  phGroup: "site",
 };
 
 async function api(path, opts = {}) {
@@ -744,16 +745,33 @@ const PH_JOB_CN = { active: "进行中", paused: "已暂停", completed: "已完
 const PH_BADGE = { queued: "b-submitted", transferring: "b-active",
   paused: "b-proposed", done: "b-published", canceled: "b-rejected",
   active: "b-active", paused2: "b-proposed", completed: "b-published" };
+const PH_ACCEPT_CN = { pending: "待验收", proven: "已证明", quarantined: "隔离",
+  repairing: "修复中", superseded: "旧代次不可切换", canceled: "已取消" };
+const PH_ACCEPT_BADGE = { pending: "b-submitted", proven: "b-published",
+  quarantined: "b-rejected", repairing: "b-active",
+  superseded: "b-proposed", canceled: "b-rejected" };
+const PH_REASON_CN = {
+  BLOCK_MISSING: "缺块", BLOCK_LENGTH_MISMATCH: "块长度不符",
+  CHUNK_HASH_MISMATCH: "块散列不符", OBJECT_HASH_MISMATCH: "对象散列不符",
+  BLOCK_UNREADABLE: "块无法读取", ROOT_HASH_MISMATCH: "根散列不符",
+  SUPERSEDED_GENERATION: "旧代次不可覆盖" };
 const fmtTs = ts => ts ? esc(ts.replace("T", " ").slice(5, 19)) : "—";
 
 async function loadPreheat() {
-  const [sites, boxes, jobs, queue, events, mans] = await Promise.all([
-    api("/preheat/sites"), api("/preheat/boxes"), api("/preheat/jobs"),
-    api("/preheat/queue"), api("/preheat/events?limit=40"),
-    api("/mirror/manifests")]);
+  const [sites, boxes, jobs, queue, events, mans, accs, repairs, sw, summary] =
+    await Promise.all([
+      api("/preheat/sites"), api("/preheat/boxes"), api("/preheat/jobs"),
+      api("/preheat/queue"), api("/preheat/events?limit=40"),
+      api("/mirror/manifests"),
+      api("/preheat/acceptances?limit=120"), api("/preheat/repairs"),
+      api("/preheat/switchable"),
+      api(`/preheat/acceptance-summary?group_by=${state.phGroup || "site"}`)]);
   state.preheat = { sites: sites.sites, boxes: boxes.boxes, jobs: jobs.jobs,
-                    queue, events: events.events, manifests: mans.manifests };
+                    queue, events: events.events, manifests: mans.manifests,
+                    acceptances: accs.acceptances, repairs: repairs.repairs,
+                    switchable: sw.switchable, summary };
   renderPhSites(); renderPhBoxes(); renderPhJobs(); renderPhQueue();
+  renderPhAccept(); renderPhSummary(); renderPhSwitchable();
   renderPhEvents(); populatePhManifest();
 }
 
@@ -789,7 +807,9 @@ function renderPhBoxes() {
         <span class="badge ${b.online ? "b-published" : "b-rejected"}">${
           b.online ? "在线" : "离线"}</span></div>
       <div class="meta">@${esc(b.site_id)} · 链路 ${b.link_cap_kbps} KB/s ·
-        库存对象 ${b.inventory_objects}（内容复用）</div>
+        库存对象 ${b.inventory_objects}（内容复用）· 已证明 ${b.proven_bytes} B ·
+        隔离 ${b.quarantine_objects} 对象 / ${b.quarantine_bytes} B ·
+        可切换 ${b.switchable_count}</div>
       <div class="pbar${usedPct >= 100 ? " bad" : ""}"><i style="width:${usedPct}%"></i></div>
       <div class="meta">磁盘 已用 ${b.disk_used_mb} + 预留 ${b.reserved_mb} /
         ${b.disk_total_mb} MB</div>
@@ -824,8 +844,10 @@ function renderPhBoxes() {
 
 function phTaskCard(t) {
   const pct = Math.round(100 * (t.progress || 0));
-  const barCls = t.status === "done" ? "done"
-    : t.status === "canceled" ? "bad" : "";
+  const acc = t.accept_state || "pending";
+  const barCls = acc === "proven" || acc === "superseded" ? "done"
+    : acc === "quarantined" || t.status === "canceled" ? "bad"
+    : acc === "repairing" ? "" : "";
   const lim = t.limit ? `<div class="meta">限速原因：<span class="err-code">[${
     esc(t.limit.code)}]</span> ${esc(t.limit.message)}</div>` : "";
   const eta = t.status === "done" ? `完成于 ${fmtTs(t.done_at)}`
@@ -833,17 +855,32 @@ function phTaskCard(t) {
   const journal = (t.journal || []).slice().reverse().map(e => `
     <div class="jl"><span class="jt">${esc(e.ts.replace("T", " ").slice(5, 19))}</span>
       <span class="je">${esc(e.event)}</span><span>${esc(e.detail)}</span></div>`).join("");
+  const la = t.last_acceptance;
+  const accLine = la ? `<div class="meta">最近验收 <b>${esc(la.acceptance_id)}</b>
+      <span class="err-code">${esc(la.digest.slice(0, 20))}…</span>
+      通过 ${la.objects_proven}/${la.objects_total}
+      ${la.reasons && Object.keys(la.reasons).length
+        ? " 原因 " + Object.entries(la.reasons).map(([k, v]) =>
+            `${PH_REASON_CN[k] || k}×${v}`).join(",") : ""}</div>` : "";
+  const repairLine = t.repair_id && t.kind !== "repair"
+    ? `<div class="meta">修复任务 <b>${esc(t.repair_id)}</b></div>` : "";
+  const kindTag = t.kind === "repair"
+    ? `<span class="badge b-proposed">修复 ${esc(t.repair_id || "")}</span>` : "";
   return `<div class="card" style="cursor:default">
     <div class="row1"><span class="id">${t.rank ? "#" + t.rank + " " : ""}${esc(t.task_id)}</span>
+      ${kindTag}
       <span class="badge ${PH_BADGE[t.status] || "b-draft"}">${
         esc(PH_STATUS_CN[t.status] || t.status)}</span>
+      ${t.status === "done" ? `<span class="badge ${PH_ACCEPT_BADGE[acc] || "b-draft"}">${
+        esc(PH_ACCEPT_CN[acc] || acc)}</span>` : ""}
       ${t.at_risk ? `<span class="badge b-rejected">超截止风险</span>` : ""}</div>
     <div class="note">${esc(t.box_id)} @ ${esc(t.site_id)} · 复用率 ${
-      Math.round(100 * t.reuse_ratio)}% · 欠账 ${t.debt_kb} KB</div>
+      Math.round(100 * t.reuse_ratio)}% · 欠账 ${t.debt_kb} KB
+      ${t.staged_bytes ? ` · 暂存 ${t.staged_bytes} B` : ""}</div>
     <div class="pbar ${barCls}"><i style="width:${pct}%"></i></div>
     <div class="meta">${t.bytes_done}/${t.bytes_total} B · 速率 ${t.rate_kbps} KB/s ·
       预留 ${t.reserved_bytes} B · ${eta}</div>
-    ${lim}
+    ${lim}${accLine}${repairLine}
     ${journal ? `<details style="margin-top:6px"><summary class="hint">处理记录（${t.journal.length}）</summary>
       <div class="journal">${journal}</div></details>` : ""}
   </div>`;
@@ -860,7 +897,8 @@ function renderPhJobs() {
       <div class="note">${esc(j.manifest_id)} · ${esc(j.version)} → ${j.targets.map(esc).join(",")}</div>
       <div class="meta">截止 ${fmtTs(j.deadline)} · 链路 ≤${j.link_cap_kbps} KB/s ·
         最小在线 ${g.done}/${g.required}（预计截止前 ${g.predicted_by_deadline}）·
-        ${p.done_bytes}/${p.total_bytes} B</div>
+        已证明 ${p.proven_tasks}/${p.total_tasks}（待验收 ${p.pending_accept_tasks} ·
+        隔离/修复 ${p.quarantined_tasks}）· ${p.done_bytes}/${p.total_bytes} B</div>
       ${j.note ? `<div class="meta">${esc(j.note)}</div>` : ""}
       <div class="actions">
         ${j.status === "active" ? `<button class="pub" data-act="pause">⏸ 暂停</button>` : ""}
@@ -889,6 +927,131 @@ function renderPhQueue() {
   $("#phQueue").innerHTML = q.queue.map(phTaskCard).join("")
     || `<div class="hint">排队队列为空</div>`;
 }
+
+function renderPhAccept() {
+  const q = state.preheat.queue;
+  const rows = q.inactive.filter(t => t.kind === "transfer" && t.status === "done"
+    && ["pending", "quarantined", "repairing", "superseded", "proven"]
+      .includes(t.accept_state));
+  // repairs show in this panel whether they are transferring (queue) or done
+  const repairRows = [
+    ...q.queue.filter(t => t.kind === "repair"),
+    ...q.inactive.filter(t => t.kind === "repair"),
+  ];
+  const stats = { pending: 0, proven: 0, quarantined: 0, repairing: 0 };
+  for (const t of [...rows, ...repairRows]) {
+    if (t.accept_state === "pending") stats.pending++;
+    else if (t.accept_state === "proven") stats.proven++;
+    else if (t.accept_state === "quarantined") stats.quarantined++;
+    else if (t.accept_state === "repairing") stats.repairing++;
+  }
+  $("#phAcceptStats").innerHTML =
+    `<span class="badge b-submitted">待验收 ${stats.pending}</span>
+     <span class="badge b-published">已证明 ${stats.proven}</span>
+     <span class="badge b-rejected">隔离 ${stats.quarantined}</span>
+     <span class="badge b-active">修复中 ${stats.repairing}</span>`;
+  const card = t => {
+    const acc = t.accept_state;
+    const la = t.last_acceptance;
+    const reasons = la && la.reasons ? Object.entries(la.reasons).map(([k, v]) =>
+      `<span class="err-code">[${PH_REASON_CN[k] || k} ×${v}]</span>`).join(" ") : "";
+    const actions = [];
+    if (acc === "pending") {
+      actions.push(`<button class="ok" data-act="accept">🔎 盒端逐项验收</button>`);
+      actions.push(`<button class="pub" data-act="damage">💥 注入缺块/损坏</button>`);
+    }
+    if (acc === "quarantined") {
+      actions.push(`<button class="ok" data-act="accept">🔁 重新验收/发起修复</button>`);
+    }
+    if (t.kind === "repair" && t.status === "done" && acc === "repairing") {
+      actions.push(`<button class="ok" data-act="accept">🔎 验收修复</button>`);
+    }
+    if (t.kind === "repair" && ["queued", "transferring", "paused"].includes(t.status)) {
+      actions.push(`<button class="danger" data-act="cancel-repair"
+        data-rid="${esc(t.repair_id || "")}">✕ 取消修复</button>`);
+    }
+    return `<div class="card" style="cursor:default">
+      <div class="row1"><span class="id">${esc(t.task_id)}</span>
+        ${t.kind === "repair" ? `<span class="badge b-proposed">修复 ${esc(t.repair_id || "")}</span>` : ""}
+        <span class="badge ${PH_ACCEPT_BADGE[acc] || "b-draft"}">${
+          esc(PH_ACCEPT_CN[acc] || acc)}</span>
+        ${t.proof_id ? `<span class="badge b-published">证明 ${esc(t.proof_id)}</span>` : ""}
+      </div>
+      <div class="note">${esc(t.box_id)} @ ${esc(t.site_id)} · ${esc(t.manifest_id || "")}
+        · 暂存 ${t.staged_bytes || 0} B · 块 ${(t.staged_chunks || []).join(",") || "-"}</div>
+      ${la ? `<div class="meta">${esc(la.acceptance_id)} · 通过率 ${
+        la.objects_proven}/${la.objects_total} · digest ${esc(la.digest.slice(0, 18))}…
+        ${reasons}</div>` : ""}
+      ${actions.length ? `<div class="actions">${actions.join("")}</div>` : ""}
+    </div>`;
+  };
+  $("#phAccept").innerHTML =
+    [...rows, ...repairRows].map(card).join("")
+    || `<div class="hint">暂无待验收/已证明/隔离/修复任务（传输完成后在此盒端验收）</div>`;
+  $$("#phAccept [data-act]").forEach(btn => btn.addEventListener("click", async () => {
+    const tid = btn.closest(".card").querySelector(".id").textContent.trim();
+    try {
+      if (btn.dataset.act === "accept") {
+        const r = await api(`/preheat/tasks/${tid}/accept`,
+                            { method: "POST", body: {} });
+        const a = r.acceptance;
+        toast(a.valid ? `✓ ${a.acceptance_id} 出证有效，进入复用与可切换集合`
+          : a.superseded ? `${a.acceptance_id} 旧代次证明，不覆盖新代次`
+          : `隔离 ${a.objects_quarantined} 对象，已创建一次修复（只补剩余块）`, "ok");
+      } else if (btn.dataset.act === "damage") {
+        const miss = prompt("注入缺块的块号（逗号分隔，留空表示不缺块）", "2");
+        if (miss === null) return;
+        const cor = prompt("注入损坏块的块号（逗号分隔，- 表示不损坏）", "-");
+        if (cor === null) return;
+        await api(`/preheat/tasks/${tid}/damage`, { method: "POST", body: {
+          missing_chunks: miss ? miss.split(",").map(Number) : [],
+          corrupt_chunks: cor && cor !== "-" ? cor.split(",").map(Number) : [] } });
+        toast("💥 已注入缺块/损坏，下次验收将隔离并修复", "ok");
+      } else if (btn.dataset.act === "cancel-repair") {
+        const rid = btn.dataset.rid;
+        const r = await api(`/preheat/repairs/${rid}/cancel`,
+                            { method: "POST", body: {} });
+        toast(r.idempotent ? "重复操作：返回首次结果"
+          : `✓ 修复 ${rid} 已取消，空间成对释放，可重新验收`, "ok");
+      }
+      await loadPreheat();
+    } catch (e) { await loadPreheat(); showError(e); }
+  }));
+}
+
+function renderPhSummary() {
+  const data = state.preheat.summary;
+  $("#phSummary").innerHTML = (data.groups || []).map(g => {
+    const reasons = Object.entries(g.reasons || {}).map(([k, v]) =>
+      `<span class="err-code">[${PH_REASON_CN[k] || k} ×${v}]</span>`).join(" ")
+      || '<span class="hint">无</span>';
+    return `<div class="card" style="cursor:default">
+      <div class="row1"><span class="id">${esc(g.key)}</span>
+        <span class="badge ${g.quarantined ? "b-rejected" : "b-published"}">
+          通过率 ${(g.pass_rate * 100).toFixed(1)}%</span></div>
+      <div class="meta">验收 ${g.acceptances} · 已证明 ${g.proven} · 隔离 ${g.quarantined}
+        · 旧代次 ${g.superseded} · 对象 ${g.objects_proven}/${g.objects_total} ·
+        隔离容量 ${g.quarantine_bytes} B</div>
+      <div class="meta">失败原因：${reasons}</div>
+      <div class="hint">盒子 ${g.boxes.join(",")} · 清单 ${g.manifests.join(",")}</div>
+    </div>`;
+  }).join("") || `<div class="hint">暂无验收记录</div>`;
+}
+
+function renderPhSwitchable() {
+  const sw = state.preheat.switchable || {};
+  $("#phSwitchable").innerHTML = Object.entries(sw).map(([bid, entries]) =>
+    `<div class="card" style="cursor:default">
+      <div class="row1"><span class="id">🖥 ${esc(bid)}</span>
+        <span class="badge b-published">${entries.length} 个可切换</span></div>
+      ${entries.map(e => `<div class="meta">${esc(e.manifest_id)} · ${esc(e.version)}
+        · 代次 ${JSON.stringify(e.generations)} · 证明 ${esc(e.proof_id)}
+        · ${fmtTs(e.proven_at)}</div>`).join("")}
+    </div>`).join("") || `<div class="hint">可切换集合为空：只有证明有效的内容才能进入</div>`;
+}
+
+$("#phGroupSite").addEventListener("click", () => { state.phGroup = "site"; loadPreheat(); });
+$("#phGroupMan").addEventListener("click", () => { state.phGroup = "manifest"; loadPreheat(); });
 
 function renderPhEvents() {
   $("#phEvents").innerHTML = state.preheat.events.map(e => `

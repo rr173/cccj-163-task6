@@ -38,6 +38,10 @@ python3 server.py 8080          # 打开 http://localhost:8080
 | 站点 `site` | 预热编排的共享带宽域：同站点盒子的授予速率之和永不超过站点容量（KB/s） |
 | 预热作业 `job` | 调度员为一批目标盒提交：`清单 + 截止时间 + 链路速率上限 + 最小在线保障`；相同内容重复提交返回首次作业（已取消则确定性新建） |
 | 传输任务 `PT-xxxx` | 作业 × 盒子：`queued 排队 / transferring 传输中 / paused 暂停 / done 完成 / canceled 取消`；磁盘预留与传输名额**成对**取得与释放 |
+| 盒端验收 `AC-xxxx` | 传输完成后盒端逐项验证**块长度、块散列、对象散列与整包根散列**；记录带**清单代次、作业编号、盒内验收序号**并形成摘要链，证明不可变（写入不改原清单/已生效地图/行程快照） |
+| 验收状态 | `pending 待验收 / proven 已证明 / quarantined 隔离 / repairing 修复中 / superseded 旧代次不可切换 / canceled 已取消`；调度页与 CLI 从同一状态展示 |
+| 修复 `RX-xxxx` | 验收发现缺块/损坏时：**只隔离受影响对象、释放其对应空间**，按剩余块创建一次修复（已证明对象不重传）；修复键 `(父任务,清单,块集合)` 幂等，并发返回首次任务；旧代次修复不得覆盖新代次证明 |
+| 可切换集合 | 每盒仅包含**证明有效**的清单（`proof_id + 根散列 + 代次`）；只有已证明内容才计入后续复用 |
 | 欠账 `debt` | 合格却未获足额带宽的任务每 tick 累计欠账（未达最小在线保障的作业双倍），调度按欠账优先——持续推进的作业不会饿死；欠账落盘，重启后保留 |
 
 **接缝校验**（候选发布闸门）：端口相互声明、全局坐标重合、限速/车道数 profile 一致、
@@ -88,7 +92,25 @@ python3 server.py 8080          # 打开 http://localhost:8080
 （相同内容返回首次作业，已取消则新建）都是确定结果；网页与 `preheat_cli.py`
 展示**相同的排队次序、限速原因与预计完成时间**（同一存储 + 同一纯调度函数）。
 编排时钟为落盘的模拟时钟（`tick` 推进），预计完成时间由确定性仿真给出；
-最小在线保障预计无法按时达成时给出预警。编排子系统只读线上与镜像清单，
+最小在线保障预计无法按时达成时给出预警。
+
+**盒端验收与隔离修复**：传输完成只代表字节**暂存**在盒上（占用磁盘、但不进复用库存）。
+盒子必须对清单逐项验收——块存在性（缺块）、声明块长度、`sha256(压缩块)`、解压后对象
+`sha256`，最后复核有序块散列卷出的**整包根散列**——并追加一条带**清单代次、作业编号、
+盒内单调验收序号**的不可变记录（`digest = sha256(规范化载荷 + 父摘要)`，自检可复算）。
+全部通过才出**有效证明**：内容才计入复用库存并进入该盒**可切换集合**；作业也只有在全部
+盒子出证（或取消/旧代次收敛）后才完成。验收发现缺块或损坏时**只隔离受影响对象**
+（精确丢弃所在块、释放对应字节，按对象记隔离容量与原因），然后**按剩余块创建一次修复**：
+修复只传这些块，已证明对象不重传；同修复键并发提交返回首次任务，取消后重新验收确定性创建
+下一尝试号。修复验收时把首次验收通过的健康块与修复块合并复核；若修复清单代次落后于盒上
+可切换集合的更新代次，证明 `full_pass` 但 `valid=false`（`superseded`），**旧代次修复绝不
+覆盖新代次证明**。盒子离线（成对让路、已传字节保留）、服务重启（传输中任务成对释放后重建，
+修复重新排队）、修复取消（成对释放、隔离保留、可重新发起）都能继续或收敛，**不残留任何
+容量占用**。证明写入不改变原清单、已生效地图或行程快照。`/preheat/acceptance-summary`
+可按**站点或清单**汇总通过率、隔离容量与失败原因；每次验收（逐块/逐对象结果、摘要链）与
+每次修复的确定结果（`repaired / superseded / requarantined / canceled`）都可追溯。
+
+编排子系统只读线上与镜像清单，
 绝不改动已生效地图、行程快照与镜像仓库。
 
 ## API（均为 JSON，前缀 `/api`）
@@ -147,6 +169,12 @@ python3 server.py 8080          # 打开 http://localhost:8080
 | POST | `/preheat/jobs/{id}/pause` · `/resume` · `/cancel` | 暂停（成对释放）· 恢复（只补剩余）· 取消（判定一次终身） |
 | GET | `/preheat/queue` | 调度队列：次序/速率/限速原因/预计完成（与 CLI 同一数据源） |
 | POST | `/preheat/tick` | 推进模拟时钟 `{seconds}`（传输前进、欠账累计） |
+| POST | `/preheat/tasks/{id}/accept` | **盒端逐项验收**（长度/块散列/对象散列/根散列）→ 不可变证明；缺块/损坏只隔离受影响对象并创建一次修复（重复验收返回首次结果） |
+| POST | `/preheat/tasks/{id}/damage` | 盒端故障注入 `{missing_chunks?, corrupt_chunks?}`（缺块/块损坏演示） |
+| GET | `/preheat/acceptances` · `/preheat/acceptances/{id}` | 验收/证明台账（可按 `box/manifest/job` 过滤；含逐块逐对象结果、摘要链） |
+| GET | `/preheat/repairs` · `/preheat/repairs/{id}` · POST `/preheat/repairs/{id}/cancel` | 修复台账（`repaired/superseded/requarantined/canceled` 确定结果）· 取消修复（成对释放、可重新发起） |
+| GET | `/preheat/switchable` | 每盒可切换集合（仅证明有效的清单，可按 `box` 过滤） |
+| GET | `/preheat/acceptance-summary` | 按 `group_by=site\|manifest` 汇总通过率/隔离容量/失败原因（可按 `site/manifest` 过滤） |
 | GET | `/preheat/events` | 编排事件流（append-only） |
 
 **限速/排队原因码**：`JOB_CAP`（作业速率上限）、`BOX_LINK`（盒链路降级）、
@@ -256,13 +284,24 @@ python3 server.py 8080          # 打开 http://localhost:8080
 ./preheat_cli.py offline RSU-02 · online RSU-02   # 盒子上下线
 ./preheat_cli.py pause PJ-0001 · resume PJ-0001   # 暂停（成对释放）· 恢复（只补剩余）
 ./preheat_cli.py cancel PJ-0001                   # 取消（判定一次终身，成对释放）
+./preheat_cli.py accept PT-0001                   # 盒端逐项验收：出证，或隔离+一次修复
+./preheat_cli.py damage PT-0001 2 0               # 故障注入：缺块 2（第二参数为损坏块，- 表示无）
+./preheat_cli.py repairs [RSU-01] · repair RX-0001
+./preheat_cli.py cancel-repair RX-0001            # 取消修复（成对释放；重新验收确定性新建）
+./preheat_cli.py acceptances [RSU-01] · acceptance AC-0002
+./preheat_cli.py switchable [RSU-01]              # 可切换集合（仅证明有效的内容）
+./preheat_cli.py summary [site|manifest]          # 通过率/隔离容量/失败原因汇总
 ./preheat_cli.py sites · boxes · jobs · show PJ-0001 · events
 ```
 
 一键预热演示：`bash demo_preheat.sh`（重置存储后走完整调度/降级/暂停/复用/取消/重启流程）。
 自动化校验：`python3 test_preheat.py`（成对占用与站点带宽/盒内空间不变量/内容复用/
 欠账不饿死/暂停恢复只补剩余/降级离线取消崩溃无幽灵占用/重启重建/配额取消重提交确定结果/
-并发不突破配额/网页与 CLI 同源/隔离线上与镜像）。
+并发不突破配额/网页与 CLI 同源/隔离线上与镜像）；
+`python3 test_acceptance.py`（盒端逐项验收与不可变证明/缺块损坏只隔离受影响对象并释放空间/
+一次修复不重传已证明对象/同键并发返回首次/修复取消与离线重启继续收敛无残留/
+旧代次修复不覆盖新代次证明/仅证明内容计入复用与可切换集合/按站点与清单的批量汇总/
+每次验收与修复可追溯/证明写入不触碰清单与线上）。
 
 ## 监管审计 CLI：audit_cli.py（只读线上）
 
@@ -306,12 +345,14 @@ server.py          标准库 HTTP API + 静态文件
 route_replay.py    路线复现/生命周期/试运行 CLI
 mirror.py          路侧盒镜像引擎：不可变清单/压缩块/验真暂存/原子换指针（只读线上）
 mirror_cli.py      镜像分发 CLI（发布 + 设备代理拉取/确认/切换）
-preheat.py         预热编排引擎：站点共享带宽/盒内空间/内容复用调度、欠账公平、成对占用（只读线上与镜像）
-preheat_cli.py     预热编排 CLI（注册容量/提交作业/队列/推进/降级/暂停/取消）
+preheat.py         预热编排引擎：站点共享带宽/盒内空间/内容复用调度、欠账公平、成对占用，
+                   盒端逐项验收与不可变证明、隔离与一次修复（只读线上与镜像）
+preheat_cli.py     预热编排 CLI（注册容量/提交作业/队列/推进/降级/暂停/取消/验收/修复/汇总）
 audit.py           监管审计引擎：证据链导入/时序重建/检查点/隔离分支/导出（只读线上）
 audit_cli.py       审计 CLI（导入/查询/检查点/分支/导出）
 test_mirror.py     镜像仓库端到端校验（验真/续拉/竞争/原子切换/重启/隔离）
 test_preheat.py    预热编排端到端校验（不变量/复用/公平/恢复/确定性/并发/同源/隔离）
+test_acceptance.py 盒端验收/隔离/修复端到端校验（证明/只隔离/一次修复/代次/收敛/汇总/追溯）
 test_audit.py      审计需求端到端校验（可重复运行）
 test_rollout.py    分组试运行端到端校验（分流/统计/冲突/幂等/原子性/重启恢复）
 demo_mirror.sh     镜像分发一键演示
@@ -322,7 +363,7 @@ static/            审查页（index.html / app.js / styles.css，含 🧪 分�
 data/mapstate.json 线上单一事实源（原子落盘；审计、镜像与预热从不写入）
 data/audit.json    审计 append-only 存储（imports/checkpoints/branches/exports/archives）
 data/mirror.json   镜像仓库存储（manifests/chunk_store/tasks/devices/events）
-data/preheat.json  预热编排存储（模拟时钟/sites/boxes/jobs/tasks/events，欠账落盘）
+data/preheat.json  预热编排存储（模拟时钟/sites/boxes/jobs/tasks/acceptances/repairs/switchable/events，欠账落盘）
 ```
 
 ## 镜像子系统的隔离不变量
@@ -351,6 +392,19 @@ data/preheat.json  预热编排存储（模拟时钟/sites/boxes/jobs/tasks/even
   首次作业已取消则确定性新建）；取消判定一次终身，重复取消返回首次结果。
 - **重启重建**：模拟时钟、欠账、已传字节全部落盘；重启时传输中任务成对释放并重新排队，
   队列次序、欠账与剩余时长由同一纯调度函数重建，网页与 CLI 看到完全一致的结果。
+- **验收才可用**：传输完成只暂存（占磁盘、不进库存）；盒端逐项验证块长度/块散列/对象散列/
+  根散列并出**不可变证明**（清单代次+作业编号+盒内验收序号+摘要链）后，内容才进入复用库存
+  与该盒可切换集合；未证明/隔离/修复中的内容绝不被后续复用计入。
+- **只隔离受影响对象 + 一次修复**：缺块/损坏精确丢弃所在块并释放其字节，只把这些对象记入
+  隔离台账；修复严格限定在剩余块上，已证明对象不重传。修复键 `(父任务, 清单散列, 块集合)`
+  幂等——并发提交返回首次任务；修复取消释放成对占用与已传字节，重新验收按尝试号确定性新建。
+- **代次不倒退**：修复清单代次落后于盒上可切换集合时，证明固化为 `superseded`（不可切换），
+  旧代次修复永远不能覆盖新代次证明。
+- **证明不可变、可自检、可追溯**：验收记录摘要按规范化载荷复算，篡改被 `check_invariants`
+  捕获；证明写入不触碰原清单、镜像仓库、已生效地图与行程快照；每次验收与修复的确定结果
+  （出证/隔离/`repaired`/`superseded`/`requarantined`/`canceled`）均可在台账与事件流追溯。
+- **收敛无残留**：离线、服务重启、修复取消、作业取消后，磁盘预留/传输名额/暂存坏块全部
+  成对释放或随修复出证转为已证明内容；隔离容量在修复出证后清零，任何路径都不残留容量占用。
 
 ## 审计子系统的隔离不变量
 
