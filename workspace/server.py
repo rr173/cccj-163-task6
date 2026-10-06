@@ -62,6 +62,16 @@ data/preheat.json):
   GET  /api/preheat/queue           (order / limit reasons / ETA — same as CLI)
   POST /api/preheat/tick            {seconds}  (advance the simulated clock)
   GET  /api/preheat/events
+
+Box-end acceptance & quarantine repair (same preheat store):
+  POST /api/preheat/tasks/{id}/accept        (item-by-item proof: length/chunk/root)
+  POST /api/preheat/tasks/{id}/corrupt       {chunk?, object_id?, mode} (defect demo)
+  POST /api/preheat/repairs/{id}/cancel      (repair cancel: converge, no leak)
+  POST /api/preheat/tasks/{id}/repair        (create/return the single repair)
+  GET  /api/preheat/acceptance?box=          (pending/proven/quarantined/repairing)
+  GET  /api/preheat/acceptance/runs?box=&task=
+  GET  /api/preheat/acceptance/summary?site=&manifest=
+  GET  /api/preheat/repairs?task=&box=
 Static UI served at /
 """
 
@@ -282,6 +292,22 @@ class Handler(BaseHTTPRequestHandler):
             return self._send_json(r, 200 if r.get("idempotent") else 201)
         if path == "/api/preheat/tick":
             return self._send_json(PREHEAT.tick(body.get("seconds", 1)))
+        m = re.match(r"^/api/preheat/tasks/([^/]+)/accept$", path)
+        if m:
+            return self._send_json(PREHEAT.accept_task(
+                m.group(1), body.get("by", "box-agent")), 201)
+        m = re.match(r"^/api/preheat/tasks/([^/]+)/corrupt$", path)
+        if m:
+            return self._send_json(PREHEAT.simulate_corruption(
+                m.group(1), body.get("chunk"), body.get("object_id"),
+                body.get("mode", "chunk")), 201)
+        m = re.match(r"^/api/preheat/tasks/([^/]+)/repair$", path)
+        if m:
+            r = PREHEAT.create_repair(m.group(1))
+            return self._send_json(r, 200 if r.get("idempotent") else 201)
+        m = re.match(r"^/api/preheat/repairs/([^/]+)/cancel$", path)
+        if m:
+            return self._send_json(PREHEAT.cancel_repair(m.group(1)))
 
         table = {
             "/api/candidates": lambda: self._send_json(ENGINE.list_candidates()),
@@ -375,6 +401,19 @@ class Handler(BaseHTTPRequestHandler):
             return self._send_json(PREHEAT.get_job(m.group(1)))
         if path == "/api/preheat/queue":
             return self._send_json(PREHEAT.queue())
+        if path == "/api/preheat/acceptance":
+            return self._send_json(PREHEAT.acceptance_board(
+                q.get("box", [None])[0]))
+        if path == "/api/preheat/acceptance/runs":
+            return self._send_json({"runs": PREHEAT.list_runs(
+                q.get("box", [None])[0], q.get("task", [None])[0],
+                int(q.get("limit", ["200"])[0]))})
+        if path == "/api/preheat/acceptance/summary":
+            return self._send_json(PREHEAT.acceptance_summary(
+                q.get("site", [None])[0], q.get("manifest", [None])[0]))
+        if path == "/api/preheat/repairs":
+            return self._send_json({"repairs": PREHEAT.list_repairs(
+                q.get("task", [None])[0], q.get("box", [None])[0])})
         if path == "/api/preheat/events":
             return self._send_json({"events": PREHEAT.list_events(
                 int(q.get("limit", ["80"])[0]))})

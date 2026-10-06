@@ -27,31 +27,89 @@ the queue, the debts and the remaining times from the persisted store: any
 task caught mid-transfer is returned to the queue and its (disk, slot) pair
 is released.
 
+Box-end acceptance & quarantine repair (盒端验收与隔离修复)
+=========================================================
+A finished transfer is merely *delivered*, never trusted. Each box then runs
+an item-by-item acceptance over the manifest objects:
+
+  * object LENGTH (declared vs. authoritative bytes on the box),
+  * per-object content hash,
+  * compressed-CHUNK hash (块散列),
+  * and finally the whole-package ROOT hash (根散列).
+
+Every run appends an **immutable acceptance proof** carrying the manifest
+generations, the job id and a per-box acceptance sequence; the proof chains
+to its predecessor and can never be rewritten. Good objects enter the box's
+proven-object map (the only content counted for later reuse and exposed in
+the **switchable set** — 可切换集合); bad/missing objects alone are
+quarantined, their already-counted space is released, and exactly ONE repair
+(keyed by (task, quarantine generation)) is created over the remaining
+chunks: proven objects are never retransferred. Concurrent submissions of
+the same repair key return the first task; an older-generation repair that
+finishes late can never overwrite newer-generation proofs. Offline boxes,
+service restarts and repair cancellation all resume or converge without
+leaking capacity.
+
 Quota changes, cancel and resubmission are deterministic: resubmitting an
 identical job replays the first job (unless it was canceled — then a fresh
 job is created); cancel is verdict-once. The web console and preheat_cli.py
 read the same store and the same pure scheduling functions, so queue order,
-rate-limit reasons and ETAs are identical.
+rate-limit reasons, ETAs and the acceptance board (pending / proven /
+quarantined / repairing) are identical.
 
 This engine writes exclusively to data/preheat.json. It never moves region
-generations, never touches patches/snapshots, and never mutates manifests.
+generations, never touches patches/snapshots, and never mutates manifests,
+the effective map or trip snapshots.
 """
 
 from __future__ import annotations
 
+import base64
 import copy
+import hashlib
 import json
 import os
 import threading
+import zlib
 from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
-from engine import DomainError, sha256, utcnow_iso
+from engine import DomainError, canonical, sha256, short, utcnow_iso
 
 KB = 1000.0                      # 1 KB = 1000 bytes (rates are KB/s)
 EPS = 1e-6
 TASK_OPEN = ("queued", "transferring")
 JOB_OPEN = ("active", "paused")
+
+# transfer-task acceptance lifecycle:
+#   queued/transferring → transferred (delivered, awaiting acceptance)
+#   → proven (all objects verified; only then "done" for the scheduler)
+#     or quarantined (some objects isolated; a repair is running)
+ACCEPT_PENDING = "transferred"
+ACCEPT_PROVEN = "proven"
+ACCEPT_QUARANTINED = "quarantined"
+ACCEPT_STAGES = (ACCEPT_PENDING, ACCEPT_QUARANTINED, ACCEPT_PROVEN)
+# acceptance failure reason codes (length / object hash / chunk hash / root)
+ACCEPT_REASONS = {
+    "ACCEPT_OK": "长度、对象散列、块散列与根散列全部一致",
+    "ACCEPT_OBJECT_LENGTH": "对象长度与清单声明不符",
+    "ACCEPT_OBJECT_HASH": "对象内容散列与清单声明不符",
+    "ACCEPT_CHUNK_MISSING": "块缺失（传输不完整）",
+    "ACCEPT_CHUNK_HASH": "压缩块散列与清单声明不符（块损坏）",
+    "ACCEPT_ROOT_HASH": "已验块的整包根散列与清单根散列不符",
+}
+
+
+def sha256_bytes(b: bytes) -> str:
+    return "sha256:" + hashlib.sha256(b).hexdigest()
+
+
+def _b64e(b: bytes) -> str:
+    return base64.b64encode(b).decode("ascii")
+
+
+def _b64d(x: str) -> bytes:
+    return base64.b64decode(x.encode("ascii"))
 
 # limit / wait reason codes (same strings in web + CLI: same store, same code)
 REASONS = {
@@ -96,7 +154,8 @@ class PreheatEngine:
                 self.state.setdefault(k, v)
         else:
             self.state = self._blank()
-        changed = self._recover_locked()
+        changed = self._migrate_locked()
+        changed = self._recover_locked() or changed
         before = json.dumps(self.state, sort_keys=True, ensure_ascii=False)
         self._settle(self.state)  # rebuild the schedule after any restart
         if changed or not os.path.exists(self.path) or \
@@ -110,9 +169,14 @@ class PreheatEngine:
                 "boxes": {},             # box_id -> roadside box record
                 "jobs": {},              # job_id -> preheat job
                 "job_by_key": {},        # content key -> job_id (deterministic resubmit)
-                "tasks": {},             # task_id -> per-(job, box) transfer task
+                "tasks": {},             # task_id -> transfer task OR repair task
+                "acceptances": {},       # run_id  -> immutable acceptance run
+                "acceptance_by_box": {}, # box_id  -> [run_id, ...] (accept seq order)
+                "proofs": {},            # proof_id -> immutable per-object proof
+                "repair_by_key": {},     # "PT|gen|chunks" -> repair task id
                 "events": [],            # append-only orchestration journal
-                "seq": {"job": 0, "task": 0, "event": 0}}
+                "seq": {"job": 0, "task": 0, "repair": 0, "run": 0,
+                        "proof": 0, "event": 0}}
 
     def _persist_locked(self):
         os.makedirs(os.path.dirname(self.path) or ".", exist_ok=True)
@@ -144,6 +208,57 @@ class PreheatEngine:
             self.state = draft
             return result
 
+    def _migrate_locked(self) -> bool:
+        """Backfill acceptance/repair fields on stores written by older code.
+
+        The pre-acceptance schema only knew transfer tasks; such tasks get the
+        new fields with safe defaults and keep their scheduler status. Proofs
+        and the immutable manifest/effective-map records are never touched.
+        """
+        s = self.state
+        changed = False
+        for b in s["boxes"].values():
+            if "proven" not in b:
+                # legacy "inventory" was derived from the current mirror image;
+                # it was produced by the mirror subsystem's own verification,
+                # so it seeds the proven-object map (no history is rewritten).
+                proven = {h: {"object_hash": h,
+                              "manifest_id": "mirror:image",
+                              "manifest_hash": None,
+                              "proven_at": b.get("created_at", s["clock"]),
+                              "proof_id": None,
+                              "source": "mirror-image"}
+                          for h in b.get("inventory", [])}
+                b["proven"] = proven
+                changed = True
+        for t in s["tasks"].values():
+            if t.get("kind", "transfer") == "transfer":
+                t.setdefault("kind", "transfer")
+                t.setdefault("accept_stage", None)
+                t.setdefault("accept_seq", 0)
+                t.setdefault("last_run_id", None)
+                t.setdefault("chunks_local", {})
+                t.setdefault("needed_chunks", [])
+                t.setdefault("quarantined", [])      # live quarantine record list
+                t.setdefault("quarantine_history", [])
+                t.setdefault("active_repair_id", None)
+                t.setdefault("run_ids", [])
+                t.setdefault("generations", {})
+                t.setdefault("manifest_hash",
+                             s["jobs"].get(t["job_id"], {}).get("manifest_hash"))
+                changed = True
+            else:
+                t.setdefault("repair_generation", t.get("generation"))
+                t.setdefault("manifest_id",
+                             s["jobs"].get(t["job_id"], {}).get("manifest_id"))
+                t.setdefault("manifest_hash",
+                             s["jobs"].get(t["job_id"], {}).get("manifest_hash"))
+                t.setdefault("chunk_indices", [])
+                t.setdefault("result", None)
+                t.setdefault("attempt", 1)
+                changed = True
+        return changed
+
     def _recover_locked(self) -> bool:
         """Rebuild queue/debts/remaining after a (crash) restart.
 
@@ -151,7 +266,8 @@ class PreheatEngine:
         pair; the service is gone, so the pair is released and the task is
         re-queued — resume only sends the remaining bytes. Debts persist.
         The caller immediately re-settles, so still-eligible tasks re-acquire
-        their pairs deterministically; nothing leaks either way.
+        their pairs deterministically; nothing leaks either way. Repair tasks
+        are recovered exactly the same way and converge after re-acceptance.
         """
         crashed = [t for t in self.state["tasks"].values()
                    if t["status"] == "transferring"]
@@ -160,14 +276,22 @@ class PreheatEngine:
         for t in crashed:
             t["status"] = "queued"
             t["reserved_bytes"] = 0.0
-            self._journal(self.state, t, "RECOVERED",
-                          "服务重启：传输名额与磁盘预留已成对释放（无幽灵占用），"
-                          f"续传只补剩余 {self._remaining(t):.0f} 字节；欠账保留")
+            if t.get("kind") == "repair":
+                msg = ("服务重启：修复名额与预留已成对释放（无幽灵占用），"
+                       f"修复 {t['repair_key']} 重新排队，只补剩余 "
+                       f"{self._remaining(t):.0f} 字节；欠账保留")
+            else:
+                msg = ("服务重启：传输名额与磁盘预留已成对释放（无幽灵占用），"
+                       f"续传只补剩余 {self._remaining(t):.0f} 字节；欠账保留")
+            self._journal(self.state, t, "RECOVERED", msg)
             t["updated_at"] = self.state["clock"]
-        self._event_locked(self.state, "SERVICE_RECOVERED",
-                           f"服务重启恢复：{len(crashed)} 个传输中任务重新排队，"
-                           f"磁盘预留与传输名额成对释放，队列/欠账/剩余时长已重建",
-                           crashed[0]["job_id"])
+        n_repair = sum(1 for t in crashed if t.get("kind") == "repair")
+        self._event_locked(
+            self.state, "SERVICE_RECOVERED",
+            f"服务重启恢复：{len(crashed)} 个传输中任务重新排队"
+            f"（其中修复任务 {n_repair} 个），磁盘预留与传输名额成对释放，"
+            f"队列/欠账/剩余时长与隔离状态已重建，无幽灵占用",
+            crashed[0]["job_id"])
         return True
 
     # ============================================================= helpers ==
@@ -192,6 +316,42 @@ class PreheatEngine:
     def _remaining(t: dict) -> float:
         return max(0.0, t["bytes_total"] - t["bytes_done"])
 
+    # ----------------------------------------------- transfer / repair sets
+    @staticmethod
+    def _is_repair(t: dict) -> bool:
+        return t.get("kind") == "repair"
+
+    def _transfer_tasks(self, s: dict) -> list:
+        return [t for t in s["tasks"].values() if t.get("kind", "transfer") == "transfer"]
+
+    def _open_transfer(self, s: dict) -> list:
+        """Transfer tasks the scheduler may grant (disk, slot) pairs to."""
+        return [t for t in self._transfer_tasks(s)
+                if t["status"] in TASK_OPEN
+                and s["jobs"][t["job_id"]]["status"] == "active"]
+
+    def _open_repairs(self, s: dict) -> list:
+        """Repair tasks the scheduler may serve: parent must still be quarantined."""
+        out = []
+        for t in s["tasks"].values():
+            if t.get("kind") != "repair" or t["status"] not in ("queued", "transferring"):
+                continue
+            parent = s["tasks"].get(t["parent_task_id"])
+            job = s["jobs"].get(t["job_id"])
+            if parent is None or job is None:
+                continue
+            if parent["accept_stage"] != ACCEPT_QUARANTINED or job["status"] != "active":
+                # canceled job / newer acceptance superseded this repair: converge
+                if t["status"] == "transferring":
+                    t["status"] = "queued"
+                    t["reserved_bytes"] = 0.0
+                continue
+            out.append(t)
+        return out
+
+    def _scheduled_tasks(self, s: dict) -> list:
+        return self._open_transfer(s) + self._open_repairs(s)
+
     def list_events(self, limit: int = 80) -> list:
         with self.lock:
             return copy.deepcopy(self.state["events"][-limit:][::-1])
@@ -209,6 +369,48 @@ class PreheatEngine:
                                   f"清单 {manifest_id} 不在镜像仓库中；请先在"
                                   f"镜像分发页生成不可变清单", 404)
             return copy.deepcopy(man)
+
+    def _mirror_blob(self, manifest_hash: str, index: int) -> Optional[bytes]:
+        """READ-ONLY fetch of one compressed chunk blob from the mirror store."""
+        if self.mirror is None:
+            return None
+        with self.mirror.lock:
+            rec = self.mirror.state.get("chunk_store", {}).get(
+                f"{manifest_hash}:{index}")
+            if rec is None:
+                return None
+            return _b64d(rec["data_b64"])
+
+    @staticmethod
+    def _decode_blob(blob: bytes) -> Optional[dict]:
+        """Decompress+decode a box-local/mirror chunk blob; None if undecodable."""
+        try:
+            return json.loads(zlib.decompress(blob).decode("utf-8"))
+        except Exception:
+            return None
+
+    def _authoritative_objects(self, manifest: dict) -> dict:
+        """object_id -> {hash, length} straight from the immutable mirror blobs.
+
+        This is the box-side ground truth at acceptance time: lengths are the
+        canonical byte lengths of the object content as packed in the manifest;
+        they are recomputed from the repository, never from mutable views.
+        """
+        truth: dict[str, dict] = {}
+        for c in manifest["chunks"]:
+            blob = self._mirror_blob(manifest["manifest_hash"], c["index"])
+            if blob is None:
+                continue
+            payload = self._decode_blob(blob)
+            if not payload:
+                continue
+            for o in payload.get("objects", []):
+                content = o.get("content")
+                truth[o["object_id"]] = {
+                    "hash": o.get("hash"),
+                    "length": len(canonical(content)),
+                    "chunk_index": c["index"]}
+        return truth
 
     # ====================================================== sites & boxes ==
     def upsert_site(self, site_id: str, capacity_kbps: float) -> dict:
@@ -273,17 +475,18 @@ class PreheatEngine:
         def m(s):
             box = s["boxes"].get(box_id)
             if box is None:
-                inventory = self._seed_inventory(box_id)
+                proven = self._seed_proven(box_id)
                 box = {"box_id": box_id, "site_id": site_id,
                        "disk_total_bytes": disk_total, "disk_used_bytes": used,
                        "link_cap_kbps": cap, "online": True,
-                       "inventory": inventory,
+                       "inventory": sorted(proven),
+                       "proven": proven,
                        "created_at": s["clock"], "updated_at": s["clock"]}
                 s["boxes"][box_id] = box
                 self._event_locked(
                     s, "BOX_REGISTERED",
                     f"注册盒子 {box_id} @ {site_id}（磁盘 {disk_total / 1e6:g} MB，"
-                    f"链路 {cap:g} KB/s，库存对象 {len(inventory)} 个）", box_id)
+                    f"链路 {cap:g} KB/s，已证明对象 {len(proven)} 个）", box_id)
             else:
                 changes = []
                 if box["site_id"] != site_id:
@@ -311,19 +514,40 @@ class PreheatEngine:
         self.commit(m)
         return self.get_box(box_id)
 
-    def _seed_inventory(self, box_id: str) -> list:
-        """Content reuse seed: objects of the box's current mirror image."""
+    def _seed_proven(self, box_id: str) -> dict:
+        """Content-reuse seed: objects of the box's current mirror image.
+
+        The mirror subsystem only flips its pointer after every object was
+        re-verified (chunk + root hash), so image objects are already proven;
+        they seed the box's proven-object map but no preheat proof is forged.
+        """
         if self.mirror is None:
-            return []
+            return {}
         with self.mirror.lock:
             dev = self.mirror.state.get("devices", {}).get(box_id)
             img = (dev or {}).get("current_image")
             if not img:
-                return []
+                return {}
             man = self.mirror.state.get("manifests", {}).get(img.get("manifest_id"))
             if not man:
-                return []
-            return sorted(o["hash"] for o in man.get("objects", []))
+                return {}
+            at = img.get("switched_at", utcnow_iso())
+            return {o["hash"]: {"object_hash": o["hash"],
+                                "manifest_id": img.get("manifest_id"),
+                                "manifest_hash": img.get("manifest_hash"),
+                                "proven_at": at,
+                                "proof_id": None,
+                                "source": "mirror-image"}
+                    for o in man.get("objects", [])}
+
+    @staticmethod
+    def _proven_hashes(box: dict) -> set:
+        return set(box.get("proven", {}).keys())
+
+    @staticmethod
+    def _refresh_inventory(box: dict):
+        """inventory (legacy reuse list) is always derived from proven map."""
+        box["inventory"] = sorted(box.get("proven", {}).keys())
 
     def set_box_link(self, box_id: str, link_cap_kbps: float) -> dict:
         try:
@@ -370,15 +594,26 @@ class PreheatEngine:
         return self.get_box(box_id)
 
     # ============================================================ content ==
-    def _needed_bytes(self, s: dict, manifest: dict, box: dict):
-        """Bytes this box still needs: chunks holding ≥1 object not in inventory."""
-        inv = set(box["inventory"])
-        total = sum(c["size"] for c in manifest["chunks"])
-        needed = 0.0
+    def _needed_chunks(self, manifest: dict, box: dict) -> list:
+        """Chunk indices still needed: chunks holding ≥1 object not PROVEN.
+
+        Only acceptance-proven objects are reusable; unproven/delivered
+        content is never assumed present, so it gets retransferred.
+        """
+        proven = self._proven_hashes(box)
+        out = []
         for c in manifest["chunks"]:
             objs = [o for o in manifest["objects"] if o["object_id"] in c["objects"]]
-            if any(o["hash"] not in inv for o in objs):
-                needed += c["size"]
+            if any(o["hash"] not in proven for o in objs):
+                out.append(c["index"])
+        return out
+
+    def _needed_bytes(self, s: dict, manifest: dict, box: dict):
+        """Bytes this box still needs: chunks holding ≥1 unproven object."""
+        total = sum(c["size"] for c in manifest["chunks"])
+        needed_idx = set(self._needed_chunks(manifest, box))
+        needed = sum(c["size"] for c in manifest["chunks"]
+                     if c["index"] in needed_idx)
         return needed, total
 
     # ============================================================== submit ==
@@ -449,9 +684,23 @@ class PreheatEngine:
                 tid = self._next(s, "task", "PT")
                 box = s["boxes"][bid]
                 needed, total = self._needed_bytes(s, man, box)
+                needed_idx = self._needed_chunks(man, box)
                 task = {"task_id": tid, "seq": s["seq"]["task"], "job_id": jid,
                         "box_id": bid, "site_id": box["site_id"],
+                        "kind": "transfer",
+                        "manifest_id": man["manifest_id"],
+                        "manifest_hash": man["manifest_hash"],
+                        "generations": dict(man["generations"]),
                         "status": "queued",
+                        "accept_stage": None,       # transferred|quarantined|proven
+                        "accept_seq": 0,
+                        "last_run_id": None,
+                        "run_ids": [],
+                        "chunks_local": {},         # index -> b64 blob actually on the box
+                        "needed_chunks": needed_idx,
+                        "quarantined": [],          # live quarantine object records
+                        "quarantine_history": [],
+                        "active_repair_id": None,
                         "bytes_total": needed, "bytes_done": 0.0,
                         "reserved_bytes": 0.0, "debt_kb": 0.0,
                         "reuse_ratio": (1.0 - needed / total) if total > EPS else 1.0,
@@ -499,8 +748,24 @@ class PreheatEngine:
         def m(s):
             job = s["jobs"][job_id]
             released = 0
+            refunded_bytes = 0.0
+            repairs_canceled = 0
             for tid in job["tasks"]:
                 t = s["tasks"][tid]
+                # cancel any repair tasks spawned by this transfer task
+                for r in list(s["tasks"].values()):
+                    if r.get("kind") != "repair" or r["parent_task_id"] != tid:
+                        continue
+                    if r["status"] in ("queued", "transferring", "paused"):
+                        if r["reserved_bytes"] > EPS:
+                            released += 1
+                        r["status"] = "canceled"
+                        r["reserved_bytes"] = 0.0
+                        r["updated_at"] = s["clock"]
+                        repairs_canceled += 1
+                        self._journal(s, r, "REPAIR_CANCELED",
+                                      "父作业取消：修复名额与预留成对释放，"
+                                      "隔离状态确定收敛，不留容量占用")
                 if t["status"] in TASK_OPEN + ("paused",):
                     if t["reserved_bytes"] > EPS:
                         released += 1
@@ -510,14 +775,32 @@ class PreheatEngine:
                     self._journal(s, t, "TASK_CANCELED",
                                   "作业取消：磁盘预留与传输名额成对释放，"
                                   "部分数据已清除，不留幽灵占用")
+                elif t["accept_stage"] in (ACCEPT_PENDING, ACCEPT_QUARANTINED):
+                    # delivered-but-unproven bytes are not reusable: refund the
+                    # space of chunks not backed by any proven object
+                    refunded = self._release_unproven_locked(s, t)
+                    if refunded > EPS:
+                        refunded_bytes += refunded
+                    t["status"] = "canceled"
+                    t["active_repair_id"] = None
+                    t["updated_at"] = s["clock"]
+                    self._journal(
+                        s, t, "TASK_CANCELED",
+                        f"作业取消：待验收/隔离内容清除，释放未证明空间 "
+                        f"{refunded:.0f} 字节；已证明对象保留可复用，不留幽灵占用")
+                t["active_repair_id"] = None
             job["status"] = "canceled"
             job["updated_at"] = s["clock"]
             result = {"outcome": "canceled", "by": by, "at": s["clock"],
-                      "released_pairs": released}
+                      "released_pairs": released,
+                      "refunded_unproven_bytes": round(refunded_bytes, 1),
+                      "repairs_canceled": repairs_canceled}
             job["cancel_result"] = result
             self._event_locked(
                 s, "JOB_CANCELED",
-                f"作业 {job_id} 已取消：{released} 对磁盘预留/传输名额成对释放", job_id)
+                f"作业 {job_id} 已取消：{released} 对预留/名额成对释放，"
+                f"{repairs_canceled} 个修复取消，释放未证明空间 "
+                f"{refunded_bytes:.0f} 字节", job_id)
             return copy.deepcopy(result)
 
         result = self.commit(m)
@@ -546,24 +829,26 @@ class PreheatEngine:
             job = s["jobs"][job_id]
             job["status"] = "paused" if pause else "active"
             job["updated_at"] = s["clock"]
-            for tid in job["tasks"]:
-                t = s["tasks"][tid]
+            repair_tasks = [r for r in s["tasks"].values()
+                            if r.get("kind") == "repair" and r["job_id"] == job_id]
+            for t in [s["tasks"][tid] for tid in job["tasks"]] + repair_tasks:
                 if pause and t["status"] in TASK_OPEN:
                     t["status"] = "paused"
                     t["reserved_bytes"] = 0.0
                     t["updated_at"] = s["clock"]
+                    what = "修复" if t.get("kind") == "repair" else "作业"
                     self._journal(s, t, "TASK_PAUSED",
-                                  "作业暂停：磁盘预留与传输名额成对释放；"
+                                  f"{what}暂停：磁盘预留与传输名额成对释放；"
                                   "恢复时只补剩余数据")
                 elif not pause and t["status"] == "paused":
                     t["status"] = "queued"
                     t["updated_at"] = s["clock"]
                     self._journal(s, t, "TASK_RESUMED",
-                                  f"作业恢复：重新排队，只补剩余 "
+                                  f"恢复：重新排队，只补剩余 "
                                   f"{self._remaining(t):.0f} 字节")
             self._event_locked(
                 s, "JOB_PAUSED" if pause else "JOB_RESUMED",
-                f"作业 {job_id} {'已暂停（名额/预留成对释放）' if pause else '已恢复（只补剩余数据）'}",
+                f"作业 {job_id} {'已暂停（传输与修复的名额/预留均成对释放）' if pause else '已恢复（只补剩余数据）'}",
                 job_id)
             return job["status"]
 
@@ -572,9 +857,8 @@ class PreheatEngine:
 
     # ============================================================ the plan ==
     def _open_tasks(self, s: dict) -> list:
-        return [t for t in s["tasks"].values()
-                if t["status"] in TASK_OPEN
-                and s["jobs"][t["job_id"]]["status"] == "active"]
+        """Every scheduler-eligible task: transfers plus live repairs."""
+        return self._scheduled_tasks(s)
 
     def _want(self, s: dict, t: dict) -> float:
         job = s["jobs"][t["job_id"]]
@@ -647,12 +931,13 @@ class PreheatEngine:
 
     def _settle(self, s: dict):
         """Apply the plan to the state: acquire/release (disk, slot) pairs."""
-        # content reuse: unstarted tasks shrink as box inventory grows;
-        # a fully reused task completes instantly without any transfer
+        # content reuse: unstarted TRANSFER tasks shrink as the box's proven
+        # map grows; a fully-proven task is proven instantly (no transfer);
+        # repairs are never auto-resized (their scope is fixed at creation).
         changed = True
         while changed:
             changed = False
-            for t in sorted(self._open_tasks(s), key=lambda x: x["seq"]):
+            for t in sorted(self._open_transfer(s), key=lambda x: x["seq"]):
                 if t["bytes_done"] > EPS or t["status"] != "queued":
                     continue
                 man = self._manifest_ref(s, t)
@@ -660,13 +945,16 @@ class PreheatEngine:
                     continue
                 box = s["boxes"][t["box_id"]]
                 needed, total = self._needed_bytes(s, man, box)
-                if abs(needed - t["bytes_total"]) > EPS:
+                new_idx = self._needed_chunks(man, box)
+                if abs(needed - t["bytes_total"]) > EPS or \
+                        new_idx != t["needed_chunks"]:
                     t["bytes_total"] = needed
+                    t["needed_chunks"] = new_idx
                     t["reuse_ratio"] = (1.0 - needed / total) if total > EPS else 1.0
                     t["updated_at"] = s["clock"]
                     changed = True
                 if needed <= EPS:
-                    self._complete_task(s, t, reused=True)
+                    self._auto_prove_reused(s, t, man)
                     changed = True
         plan = self._plan(s)
         for t in self._open_tasks(s):
@@ -676,9 +964,10 @@ class PreheatEngine:
                 t["status"] = "transferring"
                 t["reserved_bytes"] = self._remaining(t)
                 t["updated_at"] = s["clock"]
+                kind = "修复" if self._is_repair(t) else "传输"
                 self._journal(s, t, "PAIR_ACQUIRED",
                               f"成对取得磁盘预留 {self._remaining(t):.0f} 字节 + "
-                              f"传输名额（{p['grant_kbps']:g} KB/s，{p['message']}）")
+                              f"{kind}名额（{p['grant_kbps']:g} KB/s，{p['message']}）")
             elif granted:
                 t["reserved_bytes"] = self._remaining(t)
             elif not granted and t["status"] == "transferring":
@@ -688,7 +977,7 @@ class PreheatEngine:
                 self._journal(s, t, "PAIR_RELEASED",
                               f"成对释放磁盘预留与传输名额（{p['message'] if p else '计划外'}）；"
                               f"已传 {t['bytes_done']:.0f} 字节保留，续传只补剩余")
-        # job completion
+        # job completion: only fully PROVEN transfer tasks count
         for job in s["jobs"].values():
             if job["status"] in JOB_OPEN and job.get("tasks") and \
                     all(s["tasks"][tid]["status"] == "done" for tid in job["tasks"]):
@@ -696,7 +985,8 @@ class PreheatEngine:
                 job["updated_at"] = s["clock"]
                 self._event_locked(
                     s, "JOB_COMPLETED",
-                    f"作业 {job['job_id']} 全部 {len(job['tasks'])} 台盒子预热完成",
+                    f"作业 {job['job_id']} 全部 {len(job['tasks'])} 台盒子完成"
+                    f"盒端验收并证明，内容进入可切换集合",
                     job["job_id"])
 
     def _manifest_ref(self, s: dict, t: dict) -> Optional[dict]:
@@ -707,29 +997,137 @@ class PreheatEngine:
         with self.mirror.lock:
             return self.mirror.state.get("manifests", {}).get(job["manifest_id"])
 
-    def _complete_task(self, s: dict, t: dict, reused: bool = False):
-        box = s["boxes"][t["box_id"]]
+    # ----------------------------------------------- delivery / completion
+    def _stage_delivered(self, s: dict, t: dict, manifest: dict):
+        """A transfer just finished: copy delivered chunk blobs onto the box.
+
+        Delivered bytes are counted in disk usage but are NOT proven yet; the
+        box must run acceptance before any object can be reused or switched.
+        """
+        for idx in t["needed_chunks"]:
+            if str(idx) in t["chunks_local"]:
+                continue
+            blob = self._mirror_blob(manifest["manifest_hash"], idx)
+            if blob is not None:
+                t["chunks_local"][str(idx)] = _b64e(blob)
+
+    def _complete_transfer(self, s: dict, t: dict):
+        """Transfer finished: mark delivered (待验收), release the pair."""
         man = self._manifest_ref(s, t)
-        t["status"] = "done"
+        t["status"] = ACCEPT_PENDING
+        t["accept_stage"] = ACCEPT_PENDING
         t["bytes_done"] = t["bytes_total"]
         t["reserved_bytes"] = 0.0
+        t["updated_at"] = s["clock"]
+        if man is not None:
+            self._stage_delivered(s, t, man)
+            box = s["boxes"][t["box_id"]]
+            # delivered chunks now occupy the box; quarantine/cancel release
+            # exactly these holds, so no capacity can ever leak
+            self._hold_box_locked(s, box, man, t["needed_chunks"])
+            box["updated_at"] = s["clock"]
+        self._journal(
+            s, t, "TRANSFER_DELIVERED",
+            f"传输完成：{t['bytes_total']:.0f} 字节已到盒，磁盘预留与传输名额成对释放；"
+            f"等待盒端逐项验收（长度/块散列/根散列），验收前不计入复用")
+        self._event_locked(
+            s, "TRANSFER_DELIVERED",
+            f"任务 {t['task_id']}（{t['job_id']}→{t['box_id']}）传输完成，待盒端验收",
+            t["task_id"])
+
+    def _auto_prove_reused(self, s: dict, t: dict, manifest: dict):
+        """All objects already proven on the box: instant zero-transfer proof."""
+        t["bytes_total"] = 0.0
+        t["bytes_done"] = 0.0
+        t["reserved_bytes"] = 0.0
+        t["needed_chunks"] = []
+        run = self._append_run(
+            s, t, manifest, outcome="proven",
+            objects=[{**o, "result": "reused", "reason": "ACCEPT_OK",
+                      "chunk_index": next(
+                          (c["index"] for c in manifest["chunks"]
+                           if o["object_id"] in c["objects"]), None)}
+                     for o in manifest["objects"]],
+            chunk_results={str(c["index"]): {"result": "reused",
+                                             "reason": "ACCEPT_OK"}
+                           for c in manifest["chunks"]},
+            root={"declared": manifest["root_hash"],
+                  "computed": manifest["root_hash"], "match": True},
+            note="全部对象已在盒上且有有效证明（复用率 100%），零传输即时证明")
+        self._finalize_proven(s, t, manifest, run, reused=True)
+
+    def _finalize_proven(self, s: dict, t: dict, manifest: dict, run: dict,
+                         reused: bool = False):
+        box = s["boxes"][t["box_id"]]
+        # any still-open repair was created against an older quarantine
+        # generation: it must never overwrite the new proof — retire it now
+        for r in s["tasks"].values():
+            if r.get("kind") == "repair" and r["parent_task_id"] == t["task_id"] \
+                    and r["status"] in ("queued", "transferring", "paused") \
+                    and r["repair_generation"] < run["accept_seq"]:
+                r["status"] = "superseded"
+                r["reserved_bytes"] = 0.0
+                r["result"] = {"outcome": "superseded",
+                               "repair_generation": r["repair_generation"],
+                               "current_generation": run["accept_seq"],
+                               "at": s["clock"]}
+                r["done_at"] = s["clock"]
+                r["updated_at"] = s["clock"]
+                self._journal(
+                    s, r, "REPAIR_SUPERSEDED",
+                    f"父任务已到第 {run['accept_seq']} 代证明：第 "
+                    f"{r['repair_generation']} 代旧修复立即失效，不覆盖新证明，"
+                    f"名额与预留成对释放")
+                self._event_locked(s, "REPAIR_SUPERSEDED",
+                                   f"修复 {r['task_id']} 旧代次失效，不覆盖新证明",
+                                   r["task_id"])
+        t["status"] = "done"
+        t["accept_stage"] = ACCEPT_PROVEN
+        t["reserved_bytes"] = 0.0
+        t["active_repair_id"] = None
+        t["quarantined"] = []
         t["done_at"] = s["clock"]
         t["updated_at"] = s["clock"]
-        box["disk_used_bytes"] += t["bytes_total"]
+        # admit verified objects to the proven map (only reuse / switch source)
+        admitted = 0
+        for o in run["objects"]:
+            if o["result"] not in ("ok", "reused"):
+                continue
+            h = o["hash"]
+            if h not in box["proven"]:
+                admitted += 1
+            if reused:
+                rec = box["proven"].get(h, {})
+                box["proven"][h] = {"object_hash": h,
+                                    "manifest_id": manifest["manifest_id"],
+                                    "manifest_hash": manifest["manifest_hash"],
+                                    "proven_at": s["clock"],
+                                    "proof_id": rec.get("proof_id"),
+                                    "source": "reused",
+                                    "run_id": run["run_id"]}
+            else:
+                box["proven"][h] = {"object_hash": h,
+                                    "manifest_id": manifest["manifest_id"],
+                                    "manifest_hash": manifest["manifest_hash"],
+                                    "proven_at": s["clock"],
+                                    "proof_id": o.get("proof_id"),
+                                    "source": "acceptance",
+                                    "run_id": run["run_id"]}
+        self._refresh_inventory(box)
         box["updated_at"] = s["clock"]
-        if man is not None:
-            inv = set(box["inventory"])
-            inv.update(o["hash"] for o in man["objects"])
-            box["inventory"] = sorted(inv)
         self._journal(
-            s, t, "TASK_DONE",
-            ("全部内容已在盒上（复用率 100%），无需传输即完成" if reused else
-             f"传输完成：{t['bytes_total']:.0f} 字节落盘，"
-             f"磁盘预留与传输名额成对释放"))
+            s, t, "ACCEPT_PROVEN",
+            ("全部内容已有有效证明（复用率 100%），零传输完成" if reused else
+             f"盒端验收通过（第 {run['accept_seq']} 号验收证明 "
+             f"{short(run['proof_digest'])}）："
+             f"长度/对象散列/块散列/根散列全部一致，{admitted} 个新对象进入"
+             f"可切换集合并可参与后续复用"))
         self._event_locked(
-            s, "TASK_DONE",
-            f"任务 {t['task_id']}（{t['job_id']}→{t['box_id']}）完成"
-            + ("（内容全部复用）" if reused else ""), t["task_id"])
+            s, "ACCEPT_PROVEN",
+            f"任务 {t['task_id']}（{t['box_id']}）第 {run['accept_seq']} 次验收通过"
+            + ("（全复用零传输）" if reused else
+               f"，{admitted} 个对象证明有效，进入可切换集合"),
+            t["task_id"])
 
     # ================================================================ tick ==
     def tick(self, seconds: float) -> dict:
@@ -780,12 +1178,722 @@ class PreheatEngine:
                                    "bytes_done": round(t["bytes_done"], 1),
                                    "bytes_total": round(t["bytes_total"], 1)})
                 if self._remaining(t) <= EPS:
-                    self._complete_task(s, t)
-                    completed.append(t["task_id"])
+                    if self._is_repair(t):
+                        self._complete_repair(s, t)
+                        completed.append(t["task_id"])
+                    else:
+                        self._complete_transfer(s, t)
+                        completed.append(t["task_id"])
             return {"clock": s["clock"], "advanced": progressed,
                     "completed": completed}
 
         return self.commit(m)
+
+    # ==================================== box-end acceptance & quarantine ==
+    @staticmethod
+    def _chunk_size(manifest: dict, index: int) -> float:
+        c = next(c for c in manifest["chunks"] if c["index"] == index)
+        return float(c["size"])
+
+    def _hold_box_locked(self, s: dict, box: dict, manifest: dict,
+                         indices) -> float:
+        """Charge box disk for chunks not already held (dedup across tasks)."""
+        holds = box.setdefault("chunk_holds", {})
+        charged = 0.0
+        for idx in indices:
+            key = f"{manifest['manifest_hash']}:{idx}"
+            if key in holds:
+                continue
+            size = self._chunk_size(manifest, idx)
+            holds[key] = {"size": size, "task_id": None, "manifest_id":
+                          manifest["manifest_id"], "index": idx}
+            box["disk_used_bytes"] += size
+            charged += size
+        if charged > EPS:
+            box["updated_at"] = s["clock"]
+        return charged
+
+    def _release_holds_locked(self, s: dict, box: dict, manifest: dict,
+                              indices) -> float:
+        """Release chunk holds; returns released bytes (never double-frees)."""
+        holds = box.get("chunk_holds", {})
+        released = 0.0
+        for idx in indices:
+            key = f"{manifest['manifest_hash']}:{idx}"
+            rec = holds.pop(key, None)
+            if rec is not None:
+                box["disk_used_bytes"] -= rec["size"]
+                released += rec["size"]
+        box["disk_used_bytes"] = max(0.0, box["disk_used_bytes"])
+        if released > EPS:
+            box["updated_at"] = s["clock"]
+        return released
+
+    def _release_unproven_locked(self, s: dict, t: dict) -> float:
+        """Free delivered chunks that carry no proven object (cancel path)."""
+        man = self._manifest_locked(s, t)
+        box = s["boxes"][t["box_id"]]
+        proven = self._proven_hashes(box)
+        drop, keep = [], []
+        for c in man["chunks"]:
+            if str(c["index"]) not in t.get("chunks_local", {}) and \
+                    c["index"] not in t["needed_chunks"]:
+                continue
+            objs = [o for o in man["objects"] if o["object_id"] in c["objects"]]
+            # a chunk that still carries a proven object stays on disk
+            (keep if any(o["hash"] in proven for o in objs) else drop) \
+                .append(c["index"])
+        released = self._release_holds_locked(s, box, man, drop)
+        # local unproven copies are wiped; proven-object chunks remain on disk
+        for idx in drop:
+            t.get("chunks_local", {}).pop(str(idx), None)
+        return released
+
+    def _append_run(self, s: dict, t: dict, manifest: dict, *, outcome: str,
+                    objects: list, chunk_results: dict, root: dict,
+                    note: str = "", by: str = "box-agent") -> dict:
+        """Append an IMMUTABLE acceptance run + chained per-object proofs.
+
+        Carries manifest generations, job id and a per-box acceptance seq.
+        Written runs are never modified later; only new runs are appended, so
+        an older repair generation can never rewrite a newer-generation proof.
+        """
+        box = s["boxes"][t["box_id"]]
+        t["accept_seq"] += 1
+        seq = t["accept_seq"]
+        run_id = self._next(s, "run", "AR")
+        prior_ids = s["acceptance_by_box"].setdefault(t["box_id"], [])
+        parent_digest = s["acceptances"][prior_ids[-1]]["proof_digest"] \
+            if prior_ids else "sha256:0"
+        n_ok = sum(1 for o in objects if o["result"] in ("ok", "reused"))
+        n_bad = len(objects) - n_ok
+        good_idx = sorted(int(k) for k, v in chunk_results.items()
+                          if v["result"] in ("ok", "reused"))
+        run = {
+            "run_id": run_id, "accept_seq": seq,
+            "task_id": t["task_id"], "job_id": t["job_id"],
+            "box_id": t["box_id"], "site_id": t["site_id"],
+            "manifest_id": manifest["manifest_id"],
+            "manifest_hash": manifest["manifest_hash"],
+            "manifest_generations": dict(manifest["generations"]),
+            "version": manifest["source"]["version"],
+            "outcome": outcome,                  # proven | quarantined
+            "by": by, "note": note, "at": s["clock"],
+            "objects": copy.deepcopy(objects),
+            "chunks": copy.deepcopy(chunk_results),
+            "root": copy.deepcopy(root),
+            "counts": {"objects_total": len(objects), "objects_ok": n_ok,
+                       "objects_bad": n_bad,
+                       "chunks_total": len(manifest["chunks"]),
+                       "chunks_ok": len(good_idx)},
+            "parent_digest": parent_digest}
+        body = {"run_id": run_id, "accept_seq": seq, "task_id": t["task_id"],
+                "job_id": t["job_id"], "box_id": t["box_id"],
+                "manifest_hash": manifest["manifest_hash"],
+                "manifest_generations": run["manifest_generations"],
+                "outcome": outcome, "at": run["at"],
+                "objects": [{"object_id": o["object_id"], "hash": o["hash"],
+                             "length": o.get("length"), "result": o["result"],
+                             "reason": o["reason"]} for o in objects],
+                "chunks": chunk_results, "root": root,
+                "parent_digest": parent_digest}
+        run["proof_digest"] = sha256(body)
+        # one immutable proof per object; proven objects chain to the run proof
+        for o in objects:
+            if o["result"] not in ("ok", "reused"):
+                continue
+            pid = self._next(s, "proof", "AP")
+            olen = o.get("length")
+            if olen is None:   # zero-transfer reuse: length from the manifest
+                olen = self._authoritative_objects(manifest).get(
+                    o["object_id"], {}).get("length")
+            proof = {"proof_id": pid, "run_id": run_id,
+                     "accept_seq": seq, "task_id": t["task_id"],
+                     "job_id": t["job_id"], "box_id": t["box_id"],
+                     "manifest_id": manifest["manifest_id"],
+                     "manifest_hash": manifest["manifest_hash"],
+                     "manifest_generations": dict(manifest["generations"]),
+                     "object_id": o["object_id"], "object_hash": o["hash"],
+                     "length": olen, "chunk_index": o["chunk_index"],
+                     "chunk_hash": o.get("chunk_hash"),
+                     "root_hash": root.get("declared"),
+                     "result": o["result"], "at": run["at"],
+                     "parent_digest": run["proof_digest"]}
+            proof["proof_digest"] = sha256(proof)
+            s["proofs"][pid] = proof
+            o["proof_id"] = pid
+        # persist only after per-object proof ids are backfilled (immutable)
+        s["acceptances"][run_id] = run
+        prior_ids.append(run_id)
+        t["run_ids"].append(run_id)
+        t["last_run_id"] = run_id
+        return copy.deepcopy(run)
+
+    def _evaluate_objects(self, s: dict, t: dict, manifest: dict):
+        """Item-by-item box-side verification.
+
+        Verifies, for every manifest object: presence on the box, compressed
+        chunk hash (块散列), object content hash and canonical LENGTH, and
+        finally the whole-package ROOT hash over the chunks that verify.
+        Returns (objects, chunk_results, root, bad_indices, bad_objs).
+        """
+        truth = self._authoritative_objects(manifest)
+        proven = self._proven_hashes(s["boxes"][t["box_id"]])
+        chunk_bad: dict[int, str] = {}        # index -> reason code
+        chunk_objs: dict[int, list] = {}
+        local = t.get("chunks_local", {})
+        for c in manifest["chunks"]:
+            idx = c["index"]
+            objs = [o for o in manifest["objects"]
+                    if o["object_id"] in c["objects"]]
+            chunk_objs[idx] = objs
+            b64 = local.get(str(idx))
+            if b64 is None:
+                # never delivered (missing block) — unless all objs reused
+                if any(o["hash"] not in proven for o in objs):
+                    chunk_bad[idx] = "ACCEPT_CHUNK_MISSING"
+                continue
+            blob = _b64d(b64)
+            if sha256_bytes(blob) != c["hash"]:
+                chunk_bad[idx] = "ACCEPT_CHUNK_HASH"
+        objects = []
+        for o in manifest["objects"]:
+            idx = next((c["index"] for c in manifest["chunks"]
+                        if o["object_id"] in c["objects"]), None)
+            rec = {"object_id": o["object_id"], "kind": o["kind"],
+                   "hash": o["hash"], "length": None,
+                   "chunk_index": idx, "chunk_hash": None,
+                   "result": "bad", "reason": "ACCEPT_OBJECT_HASH"}
+            if o["hash"] in proven:
+                rec.update({"result": "reused", "reason": "ACCEPT_OK",
+                            "length": truth.get(o["object_id"], {}).get("length")})
+                objects.append(rec)
+                continue
+            b64 = local.get(str(idx))
+            payload = self._decode_blob(_b64d(b64)) if b64 is not None else None
+            local_obj = None
+            if payload:
+                local_obj = next((x for x in payload.get("objects", [])
+                                  if x["object_id"] == o["object_id"]), None)
+            chunk_decl = next(c["hash"] for c in manifest["chunks"]
+                              if c["index"] == idx)
+            rec["chunk_hash"] = chunk_decl
+            # item-level checks still run on decodable blobs, so a flipped
+            # object reports OBJECT_HASH/LENGTH rather than just CHUNK_HASH;
+            # undecodable / missing bytes fall back to the chunk-level reason.
+            if local_obj is not None:
+                length = len(canonical(local_obj.get("content")))
+                rec["length"] = length
+                want_len = truth.get(o["object_id"], {}).get("length")
+                if want_len is not None and length != want_len:
+                    rec["reason"] = "ACCEPT_OBJECT_LENGTH"
+                elif sha256(local_obj.get("content")) != o["hash"]:
+                    rec["reason"] = "ACCEPT_OBJECT_HASH"
+                else:
+                    rec["result"] = "ok"
+                    rec["reason"] = "ACCEPT_OK"
+            elif idx in chunk_bad:
+                rec["reason"] = chunk_bad[idx]
+            else:
+                rec["reason"] = "ACCEPT_OBJECT_HASH"
+            objects.append(rec)
+        bad_indices = sorted({o["chunk_index"] for o in objects
+                              if o["result"] == "bad"
+                              and o["chunk_index"] is not None})
+        bad_objs = [o for o in objects if o["result"] == "bad"]
+        # chunk-level results for the run record
+        chunk_results = {}
+        for c in manifest["chunks"]:
+            idx = c["index"]
+            if all(o["hash"] in proven for o in chunk_objs[idx]):
+                chunk_results[str(idx)] = {"result": "reused",
+                                           "reason": "ACCEPT_OK",
+                                           "hash": c["hash"]}
+            elif idx in chunk_bad:
+                code = chunk_bad[idx]
+                present = str(idx) in local
+                chunk_results[str(idx)] = {
+                    "result": "bad", "reason": code,
+                    "declared_hash": c["hash"],
+                    "computed_hash": (sha256_bytes(_b64d(local[str(idx)]))
+                                      if present and code != "ACCEPT_CHUNK_MISSING"
+                                      else None)}
+            else:
+                chunk_results[str(idx)] = {"result": "ok",
+                                           "reason": "ACCEPT_OK",
+                                           "hash": c["hash"]}
+        # root hash over chunks in their declared order; bad chunks excluded
+        good_hashes = [c["hash"] for c in manifest["chunks"]
+                       if chunk_results[str(c["index"])]["result"]
+                       in ("ok", "reused")]
+        computed_root = sha256({"chunks": good_hashes})
+        root = {"declared": manifest["root_hash"],
+                "computed": computed_root,
+                "match": (computed_root == manifest["root_hash"]
+                          and not bad_indices)}
+        return objects, chunk_results, root, bad_indices, bad_objs
+
+    def _quarantine_locked(self, s: dict, t: dict, manifest: dict,
+                           objects: list, chunk_results: dict, root: dict,
+                           bad_indices: list, bad_objs: list) -> dict:
+        """Isolate ONLY affected objects/chunks; release their space once.
+
+        A bad chunk still carrying a reused (already proven) object keeps its
+        disk hold — that object remains live on the box; only chunks whose
+        objects are ALL unproven can be freed (and they are the repair scope).
+        """
+        box = s["boxes"][t["box_id"]]
+        proven = self._proven_hashes(box)
+        releasable, kept_with_reused = [], []
+        for idx in bad_indices:
+            c = next(c for c in manifest["chunks"] if c["index"] == idx)
+            objs = [o for o in manifest["objects"] if o["object_id"] in c["objects"]]
+            (kept_with_reused if any(o["hash"] in proven for o in objs)
+             else releasable).append(idx)
+        released = self._release_holds_locked(s, box, manifest, releasable)
+        for idx in releasable:
+            t.get("chunks_local", {}).pop(str(idx), None)
+        records = []
+        reasons = sorted({o["reason"] for o in bad_objs})
+        for o in bad_objs:
+            records.append({
+                "object_id": o["object_id"], "object_hash": o["hash"],
+                "length": o["length"], "chunk_index": o["chunk_index"],
+                "reason": o["reason"], "reason_message": ACCEPT_REASONS[o["reason"]],
+                "at": s["clock"]})
+        gen = t["accept_seq"]
+        q = {"generation": gen, "run_id": t["last_run_id"],
+             "objects": records, "chunk_indices": bad_indices,
+             "released_chunk_indices": releasable,
+             "retained_chunk_indices": kept_with_reused,
+             "reasons": reasons,
+             "released_bytes": round(released, 1),
+             "opened_at": s["clock"], "resolved_at": None,
+             "repair_id": None}
+        t["quarantined"] = records
+        t.setdefault("quarantine_history", []).append(q)
+        t["accept_stage"] = ACCEPT_QUARANTINED
+        t["status"] = ACCEPT_QUARANTINED
+        t["active_repair_id"] = None
+        self._journal(
+            s, t, "OBJECTS_QUARANTINED",
+            f"验收发现 {len(records)} 个对象损坏/缺失（块 {bad_indices}，"
+            f"原因 {'/'.join(reasons)}）：仅隔离受影响对象并释放其空间 "
+            f"{released:.0f} 字节；其他 {sum(1 for o in objects if o['result'] in ('ok', 'reused'))} "
+            f"个对象证明保留，不重传")
+        self._event_locked(
+            s, "OBJECTS_QUARANTINED",
+            f"任务 {t['task_id']}（{t['box_id']}）隔离 {len(records)} 个对象："
+            f"块 {bad_indices}，释放 {released:.0f} 字节，根散列一致="
+            f"{root['match']}；已证明对象保留", t["task_id"])
+        return q
+
+    def accept_task(self, task_id: str, by: str = "box-agent") -> dict:
+        """Run one box-end acceptance pass (idempotency only at terminal proof).
+
+        Delivered/quarantined content is verified object by object; a fresh
+        run is appended every time. Clean runs produce the immutable proof and
+        admit objects to the switchable set; bad runs quarantine and create
+        exactly one repair over the remaining chunks.
+        """
+        with self.lock:
+            t0 = self.state["tasks"].get(task_id)
+            if not t0 or t0.get("kind", "transfer") != "transfer":
+                raise DomainError("PREHEAT_TASK_UNKNOWN",
+                                  f"传输任务 {task_id} 不存在", 404)
+            if t0["status"] == "done":
+                return {"run": self._run_view(self.state, t0["last_run_id"]),
+                        "task": self._task_view(self.state, t0),
+                        "idempotent": True}
+            if t0["status"] in ("queued", "transferring", "paused"):
+                raise DomainError(
+                    "ACCEPT_NOT_DELIVERED",
+                    f"任务 {task_id} 尚未传输完成（{t0['status']}），"
+                    f"盒端验收只能在作业传输完成后进行", 409)
+            if t0["status"] == "canceled":
+                raise DomainError("PREHEAT_TASK_CLOSED",
+                                  f"任务 {task_id} 已取消，不能验收", 409)
+            self._manifest(t0["manifest_id"])  # fail early if manifest vanished
+
+        def mutate(s):
+            t = s["tasks"][task_id]
+            manifest = self._manifest_locked(s, t)
+            objects, chunk_results, root, bad_indices, bad_objs = \
+                self._evaluate_objects(s, t, manifest)
+            outcome = "proven" if not bad_objs and root["match"] else "quarantined"
+            reason_codes = {o["reason"] for o in bad_objs}
+            if not root["match"]:
+                reason_codes.add("ACCEPT_ROOT_HASH")
+            run = self._append_run(
+                s, t, manifest, outcome=outcome, objects=objects,
+                chunk_results=chunk_results, root=root, by=by,
+                note=ACCEPT_REASONS["ACCEPT_OK"] if outcome == "proven"
+                else "；".join(ACCEPT_REASONS[r]
+                               for r in sorted(reason_codes)))
+            repair = None
+            if outcome == "proven":
+                self._finalize_proven(s, t, manifest, run)
+            else:
+                self._quarantine_locked(s, t, manifest, objects, chunk_results,
+                                        root, bad_indices, bad_objs)
+                repair = self._ensure_repair(s, t, manifest)
+            return {"run": copy.deepcopy(run),
+                    "repair": copy.deepcopy(repair) if repair else None}
+
+        out = self.commit(mutate)
+        with self.lock:
+            t = self.state["tasks"][task_id]
+            return {"run": self._run_view(self.state, out["run"]["run_id"]),
+                    "task": self._task_view(self.state, t),
+                    "repair": out["repair"], "idempotent": False}
+
+    def _manifest_locked(self, s: dict, t: dict) -> dict:
+        if self.mirror is None:
+            raise DomainError("PREHEAT_MIRROR_UNAVAILABLE",
+                              "镜像仓库不可用，无法读取内容清单", 409)
+        with self.mirror.lock:
+            man = self.mirror.state.get("manifests", {}).get(t["manifest_id"])
+            if man is None:
+                raise DomainError("PREHEAT_MANIFEST_UNKNOWN",
+                                  f"清单 {t['manifest_id']} 已不在镜像仓库", 409)
+            return copy.deepcopy(man)
+
+    # ------------------------------------------------------------- repairs
+    @staticmethod
+    def _repair_chunks(manifest: dict, quarantined: list) -> list:
+        """Chunks a repair must re-pull: chunks of the remaining bad objects.
+
+        Proven objects are never retransferred — only chunks still containing
+        quarantined objects enter the repair, and the whole chunk is pulled
+        once (chunks are the compression/hash unit).
+        """
+        return sorted({c["index"] for c in manifest["chunks"]
+                       for q in quarantined
+                       if q["object_id"] in c["objects"]})
+
+    def _ensure_repair(self, s: dict, t: dict, manifest: dict) -> dict:
+        """Create the single repair for (task, quarantine generation).
+
+        Same key submitted concurrently returns the FIRST repair task. The key
+        binds the quarantine generation and the exact remaining chunk set.
+        """
+        qrec = t["quarantine_history"][-1]
+        chunks = self._repair_chunks(manifest, t["quarantined"])
+        qrec["chunk_indices"] = chunks
+        key = f"{t['task_id']}|gen{t['accept_seq']}|chunks{','.join(map(str, chunks))}"
+        existing = s["repair_by_key"].get(key)
+        if existing:
+            r = s["tasks"][existing]
+            if r["status"] in ("queued", "transferring", "paused"):
+                t["active_repair_id"] = existing
+                qrec["repair_id"] = existing
+                return self._repair_view(s, r, idempotent=True)
+        rid = self._next(s, "repair", "PR")
+        s["seq"]["task"] += 1   # repairs share the global task ordering counter
+        size = sum(self._chunk_size(manifest, i) for i in chunks)
+        r = {"task_id": rid, "seq": s["seq"]["task"], "kind": "repair",
+             "job_id": t["job_id"], "box_id": t["box_id"], "site_id": t["site_id"],
+             "parent_task_id": t["task_id"], "repair_key": key,
+             "repair_generation": t["accept_seq"],
+             "attempt": 1,
+             "manifest_id": manifest["manifest_id"],
+             "manifest_hash": manifest["manifest_hash"],
+             "chunk_indices": chunks,
+             "status": "queued", "bytes_total": size, "bytes_done": 0.0,
+             "reserved_bytes": 0.0, "debt_kb": 0.0,
+             "result": None, "journal": [],
+             "created_at": s["clock"], "updated_at": s["clock"],
+             "done_at": None}
+        # if a same-key repair existed but was canceled, this is a fresh attempt
+        if existing:
+            old = s["tasks"][existing]
+            r["attempt"] = old.get("attempt", 1) + 1
+        s["tasks"][rid] = r
+        s["repair_by_key"][key] = rid
+        t["active_repair_id"] = rid
+        qrec["repair_id"] = rid
+        self._journal(s, r, "REPAIR_CREATED",
+                      f"按剩余块创建一次修复：重拉块 {chunks}（{size:.0f} 字节）；"
+                      f"已证明对象不重传。修复键 {short(sha256({'k': key}))}")
+        self._event_locked(
+            s, "REPAIR_CREATED",
+            f"任务 {t['task_id']}（{t['box_id']}）创建修复 {rid}："
+            f"仅重拉 {len(chunks)} 个块 {chunks}，同键并发返回首次任务", rid)
+        return self._repair_view(s, r, idempotent=False)
+
+    def create_repair(self, task_id: str) -> dict:
+        """Public (re-)submit: create/return the one repair for a quarantine."""
+        with self.lock:
+            t0 = self.state["tasks"].get(task_id)
+            if not t0 or t0.get("kind", "transfer") != "transfer":
+                raise DomainError("PREHEAT_TASK_UNKNOWN",
+                                  f"传输任务 {task_id} 不存在", 404)
+            if t0["status"] == "done":
+                raise DomainError("REPAIR_NOT_NEEDED",
+                                  f"任务 {task_id} 已证明，无需修复", 409)
+            if t0["status"] == "canceled":
+                raise DomainError("PREHEAT_TASK_CLOSED",
+                                  f"任务 {task_id} 已取消", 409)
+            if t0["accept_stage"] != ACCEPT_QUARANTINED:
+                raise DomainError("REPAIR_NOT_QUARANTINED",
+                                  f"任务 {task_id} 当前未隔离，先执行盒端验收", 409)
+            rid0 = t0.get("active_repair_id")
+            if rid0 and self.state["tasks"][rid0]["status"] in \
+                    ("queued", "transferring", "paused"):
+                return self._repair_view(self.state, self.state["tasks"][rid0],
+                                         idempotent=True)
+
+        def mutate(s):
+            t = s["tasks"][task_id]
+            manifest = self._manifest_locked(s, t)
+            view = self._ensure_repair(s, t, manifest)
+            return copy.deepcopy(view)
+
+        view = self.commit(mutate)
+        return view
+
+    def cancel_repair(self, repair_id: str) -> dict:
+        """Cancel a repair: pairs released, quarantine converges, no leak."""
+        with self.lock:
+            r0 = self.state["tasks"].get(repair_id)
+            if not r0 or r0.get("kind") != "repair":
+                raise DomainError("REPAIR_UNKNOWN", f"修复 {repair_id} 不存在", 404)
+            if r0["status"] in ("canceled", "superseded", "done"):
+                return {"repair": self._repair_view(self.state, r0),
+                        "idempotent": True}
+
+        def mutate(s):
+            r = s["tasks"][repair_id]
+            released_pair = r["reserved_bytes"] > EPS
+            r["status"] = "canceled"
+            r["reserved_bytes"] = 0.0
+            r["result"] = {"outcome": "canceled", "at": s["clock"]}
+            r["updated_at"] = s["clock"]
+            parent = s["tasks"][r["parent_task_id"]]
+            if parent.get("active_repair_id") == repair_id:
+                parent["active_repair_id"] = None
+            self._journal(s, r, "REPAIR_CANCELED",
+                          "修复取消：预留与名额成对释放，隔离对象保持隔离，"
+                          "可按同键重新提交修复（确定性新建一次尝试）")
+            self._event_locked(
+                s, "REPAIR_CANCELED",
+                f"修复 {repair_id} 已取消（父任务 {r['parent_task_id']}），"
+                f"无容量残留；隔离状态保留待重新修复", repair_id)
+            return {"released_pair": released_pair}
+
+        self.commit(mutate)
+        with self.lock:
+            return {"repair": self._repair_view(self.state,
+                                                 self.state["tasks"][repair_id]),
+                    "idempotent": False}
+
+    def _complete_repair(self, s: dict, r: dict):
+        """Repair bytes delivered: re-fetch chunks and converge by generation.
+
+        Old-generation repairs never overwrite newer-generation proofs: if the
+        parent moved on, the repair is marked 'superseded' and touches nothing.
+        """
+        parent = s["tasks"][r["parent_task_id"]]
+        manifest = self._manifest_locked(s, r)
+        stale = (parent["accept_stage"] != ACCEPT_QUARANTINED
+                 or r["repair_generation"] != parent["accept_seq"])
+        r["bytes_done"] = r["bytes_total"]
+        r["reserved_bytes"] = 0.0
+        r["updated_at"] = s["clock"]
+        if stale:
+            r["status"] = "superseded"
+            r["result"] = {"outcome": "superseded",
+                           "repair_generation": r["repair_generation"],
+                           "current_generation": parent["accept_seq"],
+                           "at": s["clock"]}
+            r["done_at"] = s["clock"]
+            if parent.get("active_repair_id") == r["task_id"]:
+                parent["active_repair_id"] = None
+            self._journal(
+                s, r, "REPAIR_SUPERSEDED",
+                f"修复针对第 {r['repair_generation']} 代隔离，父任务已到第 "
+                f"{parent['accept_seq']} 代（{parent['accept_stage']}）："
+                f"旧代次修复不覆盖新代次证明，结果确定失效且不占容量")
+            self._event_locked(s, "REPAIR_SUPERSEDED",
+                               f"修复 {r['task_id']} 旧代次失效，不覆盖新证明",
+                               r["task_id"])
+            return
+        box = s["boxes"][r["box_id"]]
+        applied, blocked = [], []
+        for idx in r["chunk_indices"]:
+            # never overwrite a chunk a NEWER proof already verified
+            already_ok = str(idx) in parent.get("chunks_local", {})
+            blob = self._mirror_blob(manifest["manifest_hash"], idx)
+            cmeta = next(c for c in manifest["chunks"] if c["index"] == idx)
+            if blob is None or sha256_bytes(blob) != cmeta["hash"]:
+                blocked.append(idx)
+                continue
+            if not already_ok:
+                parent["chunks_local"][str(idx)] = _b64e(blob)
+                self._hold_box_locked(s, box, manifest, [idx])
+            applied.append(idx)
+        r["done_at"] = s["clock"]
+        if blocked:
+            # repository cannot serve a good chunk yet: repair converges to a
+            # recorded blocked result; quarantine stays; no reservation leaks
+            r["status"] = "done"
+            r["result"] = {"outcome": "blocked_upstream",
+                           "blocked_chunks": blocked,
+                           "applied_chunks": applied, "at": s["clock"]}
+            parent["active_repair_id"] = None
+            self._journal(
+                s, r, "REPAIR_BLOCKED",
+                f"修复完成但上游块 {blocked} 暂不可用/损坏；已应用块 {applied}，"
+                f"隔离保持，预留全部释放，待仓库恢复后重新提交修复")
+            self._event_locked(s, "REPAIR_BLOCKED",
+                               f"修复 {r['task_id']} 受上游阻塞：{blocked}", r["task_id"])
+            return
+        r["status"] = "done"
+        r["result"] = {"outcome": "delivered", "applied_chunks": applied,
+                       "at": s["clock"]}
+        self._journal(
+            s, r, "REPAIR_DELIVERED",
+            f"修复块 {applied} 已到盒（{r['bytes_total']:.0f} 字节），"
+            f"成对释放；自动执行第 {parent['accept_seq'] + 1} 次验收")
+        self._event_locked(
+            s, "REPAIR_DELIVERED",
+            f"修复 {r['task_id']} 交付完成，触发父任务 {r['parent_task_id']} 重新验收",
+            r["task_id"])
+        # automatic re-acceptance over the remaining quarantined objects
+        objects, chunk_results, root, bad_indices, bad_objs = \
+            self._evaluate_objects(s, parent, manifest)
+        outcome = "proven" if not bad_objs and root["match"] else "quarantined"
+        run = self._append_run(
+            s, parent, manifest, outcome=outcome, objects=objects,
+            chunk_results=chunk_results, root=root, by="repair-agent",
+            note=ACCEPT_REASONS["ACCEPT_OK"] if outcome == "proven"
+            else "修复后仍有损坏对象，保持隔离")
+        r["result"]["run_id"] = run["run_id"]
+        if outcome == "proven":
+            qh = parent["quarantine_history"][-1]
+            qh["resolved_at"] = s["clock"]
+            qh["resolution"] = "repaired"
+            qh["resolution_run_id"] = run["run_id"]
+            self._finalize_proven(s, parent, manifest, run)
+        else:
+            self._quarantine_locked(s, parent, manifest, objects, chunk_results,
+                                    root, bad_indices, bad_objs)
+            # do NOT auto-create another repair in the same commit; operator (or
+            # next tick-driven policy) submits one — convergence is bounded.
+
+    # ------------------------------------------------- corruption simulator
+    def simulate_corruption(self, task_id: str, chunk: Optional[int] = None,
+                            object_id: Optional[str] = None,
+                            mode: str = "chunk") -> dict:
+        """Demonstrate box-side defects on delivered content (simulation only).
+
+        mode=chunk: flip compressed chunk bytes (块散列不符) at one chunk;
+        mode=object: flip one object's content (对象散列/长度不符);
+        mode=length: truncate one object's content (长度不符);
+        mode=missing: drop a delivered chunk from the box entirely (缺块).
+        The mirror repository, the manifest and the effective map are never
+        touched — only this box-local staging copy changes.
+        """
+        with self.lock:
+            t = self.state["tasks"].get(task_id)
+            if not t or t.get("kind", "transfer") != "transfer":
+                raise DomainError("PREHEAT_TASK_UNKNOWN",
+                                  f"传输任务 {task_id} 不存在", 404)
+            if t["status"] not in ACCEPT_STAGES:
+                raise DomainError("ACCEPT_NOT_DELIVERED",
+                                  f"任务 {task_id} 尚无已到盒内容可注入缺陷（{t['status']}）",
+                                  409)
+            manifest = self._manifest(t["manifest_id"])
+
+        def mutate(s):
+            t = s["tasks"][task_id]
+            local = t["chunks_local"]
+            if mode == "missing":
+                idx = chunk if chunk is not None else \
+                    int(sorted(local, key=int)[-1])
+                if str(idx) not in local:
+                    raise DomainError("ACCEPT_CHUNK_MISSING",
+                                      f"盒上没有块 {idx}", 409)
+                local.pop(str(idx))
+                what = f"移除盒上块 {idx}（模拟缺块）"
+            elif mode == "chunk":
+                idx = chunk if chunk is not None else \
+                    int(sorted(local, key=int)[-1])
+                if str(idx) not in local:
+                    raise DomainError("ACCEPT_CHUNK_MISSING",
+                                      f"盒上没有块 {idx}", 409)
+                blob = _b64d(local[str(idx)])
+                local[str(idx)] = _b64e(blob[:-1] + bytes([blob[-1] ^ 0xA5]))
+                what = f"翻转块 {idx} 压缩字节（模拟块损坏）"
+            else:
+                oid = object_id
+                if oid is None and chunk is None:
+                    raise DomainError("BAD_REQUEST",
+                                      "object/chunk 模式需指定 object_id 或 chunk", 400)
+                idx = chunk
+                if idx is None:
+                    c = next((c for c in manifest["chunks"]
+                              if oid in c["objects"]), None)
+                    if c is None:
+                        raise DomainError("BAD_REQUEST",
+                                          f"对象 {oid} 不在清单中", 400)
+                    idx = c["index"]
+                b64 = local.get(str(idx))
+                if b64 is None:
+                    raise DomainError("ACCEPT_CHUNK_MISSING",
+                                      f"盒上没有块 {idx}（可能已隔离释放）", 409)
+                payload = self._decode_blob(_b64d(b64))
+                if payload is None:
+                    raise DomainError("ACCEPT_CHUNK_HASH",
+                                      f"块 {idx} 已损坏，无法定位对象", 409)
+                target = next((o for o in payload["objects"]
+                               if oid is None or o["object_id"] == oid), None)
+                if target is None:
+                    raise DomainError("BAD_REQUEST", f"块 {idx} 中无对象 {oid}", 400)
+                content = canonical(target["content"])
+                if mode == "length":
+                    # JSON-safe shrink: the canonical LENGTH changes, so the
+                    # box reports ACCEPT_OBJECT_LENGTH
+                    target["content"] = {"__corrupt_length__":
+                                         content.decode("utf-8", "replace")[:40]}
+                else:
+                    # JSON-safe, length-preserving corruption: flip one hex
+                    # character inside an existing long string field (e.g. a
+                    # tile hash in the descriptor) — same length, different
+                    # object content hash => ACCEPT_OBJECT_HASH, not LENGTH
+                    inner = target["content"]
+                    flipped = False
+                    if isinstance(inner, dict):
+                        def flip(d):
+                            for k, v in d.items():
+                                if isinstance(v, str) and len(v) >= 8 \
+                                        and any(ch in "0123456789abcdef" for ch in v):
+                                    i = next(i for i, ch in enumerate(v)
+                                             if ch in "0123456789abcdef")
+                                    d[k] = v[:i] + \
+                                        ("f" if v[i] != "f" else "0") + v[i + 1:]
+                                    return True
+                                if isinstance(v, dict) and flip(v):
+                                    return True
+                            return False
+                        flipped = flip(inner)
+                    if not flipped:
+                        raise DomainError("BAD_REQUEST",
+                                          f"对象 {target['object_id']} 无可翻转字段",
+                                          400)
+                blob = zlib.compress(canonical(payload), 9)
+                local[str(idx)] = _b64e(blob)
+                what = (f"截断对象 {target['object_id']}（模拟长度不符）"
+                        if mode == "length"
+                        else f"翻转对象 {target['object_id']} 内容（模拟对象损坏）")
+            t["updated_at"] = s["clock"]
+            self._journal(s, t, "DEFECT_INJECTED", what + "；镜像清单与已生效地图不变")
+            self._event_locked(s, "DEFECT_INJECTED",
+                               f"任务 {task_id}（{t['box_id']}）{what}", task_id)
+            return {"task_id": task_id, "mode": mode, "what": what,
+                    "chunk": idx if "idx" in locals() else None}
+
+        return self.commit(mutate)
 
     # ================================================================ views ==
     def _predict(self, s: dict) -> dict:
@@ -828,14 +1936,28 @@ class PreheatEngine:
 
     def _task_view(self, s: dict, t: dict, plan=None, eta=None, ranks=None) -> dict:
         job = s["jobs"][t["job_id"]]
+        if t.get("kind") == "repair":
+            return self._repair_view(s, t, plan=plan, eta=eta, ranks=ranks)
         v = {"task_id": t["task_id"], "job_id": t["job_id"], "box_id": t["box_id"],
-             "site_id": t["site_id"], "status": t["status"],
+             "site_id": t["site_id"], "kind": "transfer",
+             "manifest_id": t["manifest_id"],
+             "status": t["status"], "accept_stage": t.get("accept_stage"),
+             "accept_seq": t.get("accept_seq", 0),
+             "last_run_id": t.get("last_run_id"),
              "bytes_total": round(t["bytes_total"], 1),
              "bytes_done": round(t["bytes_done"], 1),
              "remaining_bytes": round(self._remaining(t), 1),
              "reserved_bytes": round(t["reserved_bytes"], 1),
              "debt_kb": round(t["debt_kb"], 3),
              "reuse_ratio": round(t["reuse_ratio"], 4),
+             "needed_chunks": list(t.get("needed_chunks", [])),
+             "local_chunks": sorted(int(k) for k in t.get("chunks_local", {})),
+             "quarantine": self._quarantine_view(s, t),
+             "active_repair": (self._repair_view(
+                 s, s["tasks"][t["active_repair_id"]])
+                 if t.get("active_repair_id")
+                 and t["active_repair_id"] in s["tasks"] else None),
+             "runs": list(t.get("run_ids", [])),
              "progress": (round(t["bytes_done"] / t["bytes_total"], 4)
                           if t["bytes_total"] > EPS else 1.0),
              "journal": copy.deepcopy(t["journal"]),
@@ -870,13 +1992,70 @@ class PreheatEngine:
             v["at_risk"] = False
         return v
 
+    def _quarantine_view(self, s: dict, t: dict) -> Optional[dict]:
+        if not t.get("quarantine_history"):
+            return None
+        q = t["quarantine_history"][-1]
+        return {"generation": q["generation"], "run_id": q["run_id"],
+                "objects": copy.deepcopy(t.get("quarantined", [])),
+                "object_count": len(t.get("quarantined", [])),
+                "chunk_indices": list(q.get("chunk_indices", [])),
+                "reasons": list(q.get("reasons", [])),
+                "released_bytes": q.get("released_bytes", 0.0),
+                "repair_id": q.get("repair_id"),
+                "opened_at": q.get("opened_at"),
+                "resolved_at": q.get("resolved_at"),
+                "resolution": q.get("resolution")}
+
+    def _repair_view(self, s: dict, r: dict, idempotent: bool = False,
+                     plan=None, eta=None, ranks=None) -> dict:
+        p = (plan or {}).get(r["task_id"])
+        v = {"task_id": r["task_id"], "kind": "repair",
+             "job_id": r["job_id"], "box_id": r["box_id"], "site_id": r["site_id"],
+             "parent_task_id": r["parent_task_id"],
+             "repair_key": r["repair_key"],
+             "repair_generation": r["repair_generation"],
+             "attempt": r.get("attempt", 1),
+             "chunk_indices": list(r.get("chunk_indices", [])),
+             "status": r["status"],
+             "bytes_total": round(r["bytes_total"], 1),
+             "bytes_done": round(r["bytes_done"], 1),
+             "remaining_bytes": round(self._remaining(r), 1),
+             "reserved_bytes": round(r["reserved_bytes"], 1),
+             "debt_kb": round(r.get("debt_kb", 0.0), 3),
+             "result": copy.deepcopy(r.get("result")),
+             "progress": (round(r["bytes_done"] / r["bytes_total"], 4)
+                          if r["bytes_total"] > EPS else 1.0),
+             "rate_kbps": (p["grant_kbps"] if p and r["status"] == "transferring"
+                           else 0.0),
+             "limit": ({"code": p["code"], "message": p["message"]}
+                       if p and r["status"] in TASK_OPEN else None),
+             "journal": copy.deepcopy(r["journal"]),
+             "created_at": r["created_at"], "updated_at": r["updated_at"],
+             "done_at": r.get("done_at"), "idempotent": idempotent}
+        if ranks is not None and r["task_id"] in ranks:
+            v["rank"] = ranks[r["task_id"]]
+        secs = (eta or {}).get(r["task_id"])
+        v["eta_seconds"] = None if secs is None else _round6(secs)
+        return v
+
     def _job_view(self, s: dict, job: dict, idempotent: bool = False) -> dict:
         plan, eta, ranks = self._views(s)
         tasks = [self._task_view(s, s["tasks"][tid], plan, eta, ranks)
                  for tid in job.get("tasks", [])]
         done = sum(1 for t in tasks if t["status"] == "done")
+        pending = sum(1 for t in tasks
+                      if t["status"] in ("queued", "transferring", "paused"))
+        awaiting = sum(1 for t in tasks if t["status"] == ACCEPT_PENDING)
+        quarantined = sum(1 for t in tasks if t["status"] == ACCEPT_QUARANTINED)
+        repairs = [self._repair_view(s, r, plan, eta, ranks)
+                   for r in s["tasks"].values()
+                   if r.get("kind") == "repair" and r["job_id"] == job["job_id"]]
+        repairs.sort(key=lambda r: r["task_id"])
+        repairing = sum(1 for r in repairs
+                        if r["status"] in ("queued", "transferring", "paused"))
         total_b = sum(t["bytes_total"] for t in tasks)
-        done_b = sum(t["bytes_done"] for t in tasks)
+        done_b = sum(t["bytes_done"] for t in tasks if t["status"] == "done")
         by_deadline = done + sum(
             1 for t in tasks if t["status"] in TASK_OPEN + ("paused",)
             and t["eta"] is not None and t["eta"] <= job["deadline"])
@@ -887,12 +2066,16 @@ class PreheatEngine:
              "status": job["status"], "created_by": job["created_by"],
              "created_at": job["created_at"], "updated_at": job["updated_at"],
              "progress": {"done_tasks": done, "total_tasks": len(tasks),
+                          "transferring_tasks": pending,
+                          "awaiting_acceptance": awaiting,
+                          "quarantined_tasks": quarantined,
+                          "repairing_tasks": repairing,
                           "done_bytes": round(done_b, 1),
                           "total_bytes": round(total_b, 1)},
              "guarantee": {"required": job["min_online"], "done": done,
                            "predicted_by_deadline": by_deadline,
                            "at_risk": by_deadline < job["min_online"]},
-             "tasks": tasks, "idempotent": idempotent}
+             "tasks": tasks, "repairs": repairs, "idempotent": idempotent}
         if job["cancel_result"]:
             v["cancel_result"] = copy.deepcopy(job["cancel_result"])
         return v
@@ -905,7 +2088,9 @@ class PreheatEngine:
             open_tasks = sorted(self._open_tasks(s), key=self._priority(s))
             resting = sorted(
                 (t for t in s["tasks"].values()
-                 if t["status"] in ("paused", "done", "canceled")),
+                 if t["status"] in ("paused", "done", "canceled", "superseded")
+                 or (t.get("kind") == "transfer"
+                     and t["status"] in ACCEPT_STAGES)),
                 key=lambda t: t["seq"], reverse=True)
             site_views = []
             for site in sorted(s["sites"].values(), key=lambda x: x["site_id"]):
@@ -980,14 +2165,223 @@ class PreheatEngine:
         reserved = sum(t["reserved_bytes"] for t in s["tasks"].values()
                        if t["box_id"] == b["box_id"] and t["status"] == "transferring")
         v = copy.deepcopy(b)
+        v.pop("proven", None)   # expose counts/switchable set, not the full map
         v["reserved_bytes"] = round(reserved, 1)
         v["free_bytes"] = round(b["disk_total_bytes"] - b["disk_used_bytes"]
                                 - reserved, 1)
         v["disk_total_mb"] = _round6(b["disk_total_bytes"] / 1e6)
         v["disk_used_mb"] = _round6(b["disk_used_bytes"] / 1e6)
         v["reserved_mb"] = _round6(reserved / 1e6)
-        v["inventory_objects"] = len(b["inventory"])
+        v["proven_objects"] = len(b.get("proven", {}))
+        v["inventory_objects"] = len(b.get("inventory", []))
+        # switchable set: manifests whose every object is proven on this box
+        switchable = []
+        if self.mirror is not None:
+            with self.mirror.lock:
+                for man in self.mirror.state.get("manifests", {}).values():
+                    hashes = {o["hash"] for o in man["objects"]}
+                    if hashes and hashes <= self._proven_hashes(b):
+                        switchable.append({
+                            "manifest_id": man["manifest_id"],
+                            "version": man["source"]["version"],
+                            "root_hash": man["root_hash"],
+                            "objects": len(hashes)})
+        switchable.sort(key=lambda x: x["manifest_id"], reverse=True)
+        v["switchable"] = switchable
         return v
+
+    # ============================================ acceptance board / query ==
+    def _run_view(self, s: dict, run_id: str) -> dict:
+        run = s["acceptances"].get(run_id)
+        if not run:
+            raise DomainError("ACCEPT_RUN_UNKNOWN", f"验收记录 {run_id} 不存在", 404)
+        out = copy.deepcopy(run)
+        out["proofs"] = sorted(
+            ({"proof_id": p["proof_id"], "object_id": p["object_id"],
+              "object_hash": p["object_hash"], "length": p["length"],
+              "chunk_index": p["chunk_index"], "proof_digest": p["proof_digest"]}
+             for p in s["proofs"].values() if p["run_id"] == run_id),
+            key=lambda x: x["proof_id"])
+        return out
+
+    def list_runs(self, box_id: Optional[str] = None,
+                  task_id: Optional[str] = None, limit: int = 200) -> list:
+        with self.lock:
+            ids: list = []
+            if task_id:
+                t = self.state["tasks"].get(task_id)
+                if not t:
+                    raise DomainError("PREHEAT_TASK_UNKNOWN",
+                                      f"任务 {task_id} 不存在", 404)
+                ids = list(t.get("run_ids", []))
+            elif box_id:
+                if box_id not in self.state["boxes"]:
+                    raise DomainError("PREHEAT_BOX_UNKNOWN",
+                                      f"盒子 {box_id} 未注册", 404)
+                ids = list(self.state["acceptance_by_box"].get(box_id, []))
+            else:
+                ids = sorted(self.state["acceptances"],
+                             key=lambda r: self.state["acceptances"][r]["accept_seq"])
+                ids = [r["run_id"] for r in sorted(
+                    self.state["acceptances"].values(),
+                    key=lambda r: (r["box_id"], r["accept_seq"]))]
+            return [self._run_view(self.state, rid)
+                    for rid in ids[-limit:][::-1]]
+
+    def list_repairs(self, task_id: Optional[str] = None,
+                     box_id: Optional[str] = None) -> list:
+        with self.lock:
+            out = []
+            for r in self.state["tasks"].values():
+                if r.get("kind") != "repair":
+                    continue
+                if task_id and r["parent_task_id"] != task_id:
+                    continue
+                if box_id and r["box_id"] != box_id:
+                    continue
+                out.append(self._repair_view(self.state, r))
+            return sorted(out, key=lambda r: r["task_id"], reverse=True)
+
+    def acceptance_board(self, box_id: Optional[str] = None) -> dict:
+        """Single state behind web + CLI: pending / proven / quarantined / repairs."""
+        with self.lock:
+            s = self.state
+            rows = []
+            for t in self._transfer_tasks(s):
+                if box_id and t["box_id"] != box_id:
+                    continue
+                tv = self._task_view(s, t)
+                stage = ("proven" if t["status"] == "done"
+                         else t["accept_stage"]
+                         or ("transferring" if t["status"] in TASK_OPEN
+                             else t["status"]))
+                # external stage vocabulary for web/CLI board
+                stage = {"transferred": "pending",
+                         "proven": "proven",
+                         "quarantined": "quarantined"}.get(stage, stage)
+                rows.append({"task_id": t["task_id"], "job_id": t["job_id"],
+                             "box_id": t["box_id"], "site_id": t["site_id"],
+                             "manifest_id": t["manifest_id"],
+                             "version": s["jobs"][t["job_id"]]["version"],
+                             "stage": stage, "status": t["status"],
+                             "accept_seq": t.get("accept_seq", 0),
+                             "last_run_id": t.get("last_run_id"),
+                             "quarantine": tv["quarantine"],
+                             "active_repair": tv["active_repair"]})
+            buckets = {"transferring": [], "pending": [], "proven": [],
+                       "quarantined": [], "repairing": [], "canceled": []}
+            for r in rows:
+                if r["stage"] == "proven":
+                    buckets["proven"].append(r)
+                elif r["stage"] == "pending":
+                    buckets["pending"].append(r)
+                elif r["stage"] == "quarantined":
+                    buckets["repairing" if r["active_repair"] and
+                        r["active_repair"]["status"] in
+                        ("queued", "transferring", "paused")
+                        else "quarantined"].append(r)
+                elif r["stage"] == "canceled":
+                    buckets["canceled"].append(r)
+                else:
+                    buckets["transferring"].append(r)
+            return {"clock": s["clock"], "counts": {k: len(v) for k, v in
+                                                    buckets.items()},
+                    **buckets}
+
+    def acceptance_summary(self, site_id: Optional[str] = None,
+                           manifest_id: Optional[str] = None) -> dict:
+        """Batch rollup by site and manifest: pass rate / quarantine capacity.
+
+        Every acceptance and repair result is traceable: runs and repairs are
+        returned alongside the aggregates, grouped by site then manifest.
+        """
+        with self.lock:
+            s = self.state
+            groups: dict[tuple, dict] = {}
+
+            def gkey(t):
+                return (t["site_id"], t["manifest_id"])
+
+            def g(t):
+                k = gkey(t)
+                grp = groups.setdefault(k, {
+                    "site_id": t["site_id"], "manifest_id": t["manifest_id"],
+                    "version": s["jobs"][t["job_id"]]["version"],
+                    "tasks": 0, "proven": 0, "pending": 0, "quarantined": 0,
+                    "canceled": 0,
+                    "runs": 0, "objects_total": 0, "objects_ok": 0,
+                    "objects_bad": 0, "quarantine_bytes": 0.0,
+                    "repairs_open": 0, "repairs_done": 0,
+                    "repairs_canceled": 0, "repairs_superseded": 0,
+                    "failure_reasons": {}, "task_ids": []})
+                return grp
+            for t in self._transfer_tasks(s):
+                if site_id and t["site_id"] != site_id:
+                    continue
+                if manifest_id and t["manifest_id"] != manifest_id:
+                    continue
+                grp = g(t)
+                grp["tasks"] += 1
+                grp["task_ids"].append(t["task_id"])
+                if t["status"] == "done":
+                    grp["proven"] += 1
+                elif t["status"] == "canceled":
+                    grp.setdefault("canceled", 0)
+                    grp["canceled"] += 1
+                elif t["accept_stage"] == ACCEPT_PENDING:
+                    grp["pending"] += 1
+                elif t["accept_stage"] == ACCEPT_QUARANTINED:
+                    grp["quarantined"] += 1
+                for rid in t.get("run_ids", []):
+                    run = s["acceptances"][rid]
+                    grp["runs"] += 1
+                    grp["objects_total"] += run["counts"]["objects_total"]
+                    grp["objects_ok"] += run["counts"]["objects_ok"]
+                    grp["objects_bad"] += run["counts"]["objects_bad"]
+                # only LIVE (unresolved) quarantine consumes isolated capacity
+                for q in t.get("quarantine_history", []):
+                    if q.get("resolution"):
+                        continue
+                    if t["status"] == "canceled":
+                        continue
+                    grp["quarantine_bytes"] += q.get("released_bytes", 0.0)
+                    for code in q.get("reasons", []):
+                        grp["failure_reasons"][code] = \
+                            grp["failure_reasons"].get(code, 0) + 1
+            for r in s["tasks"].values():
+                if r.get("kind") != "repair":
+                    continue
+                parent = s["tasks"].get(r["parent_task_id"])
+                if parent is None:
+                    continue
+                # group strictly by the PARENT transfer task's site/manifest
+                if site_id and parent["site_id"] != site_id:
+                    continue
+                if manifest_id and r["manifest_id"] != manifest_id:
+                    continue
+                grp = g(parent)
+                key = {"done": "repairs_done", "canceled": "repairs_canceled",
+                       "superseded": "repairs_superseded"}.get(r["status"])
+                if key:
+                    grp[key] += 1
+                elif r["status"] in ("queued", "transferring", "paused"):
+                    grp["repairs_open"] += 1
+            out = []
+            for grp in groups.values():
+                decided = grp["proven"] + grp["quarantined"]
+                grp["pass_rate"] = round(grp["proven"] / decided, 4) if decided else None
+                grp["object_pass_rate"] = (
+                    round(grp["objects_ok"] / grp["objects_total"], 4)
+                    if grp["objects_total"] else None)
+                grp["quarantine_bytes"] = round(grp["quarantine_bytes"], 1)
+                grp["quarantine_mb"] = _round6(grp["quarantine_bytes"] / 1e6)
+                grp["failure_reasons"] = [
+                    {"code": c, "message": ACCEPT_REASONS.get(c, c), "count": n}
+                    for c, n in sorted(grp["failure_reasons"].items())]
+                out.append(grp)
+            out.sort(key=lambda x: (x["site_id"], x["manifest_id"]))
+            return {"clock": s["clock"], "site_id": site_id,
+                    "manifest_id": manifest_id, "groups": out}
 
     # ======================================================== invariants ==
     def check_invariants(self) -> list:
@@ -1019,4 +2413,30 @@ class PreheatEngine:
                     bad.append(f"盒子 {b['box_id']} 磁盘超占: "
                                f"{b['disk_used_bytes']}+{reserved} > "
                                f"{b['disk_total_bytes']}")
+                # 3b. chunk holds are exactly the delivered/proven on-disk bytes
+                hold_bytes = sum(h["size"] for h in b.get("chunk_holds", {}).values())
+                if hold_bytes > b["disk_used_bytes"] + EPS:
+                    bad.append(f"盒子 {b['box_id']} 块持有 {hold_bytes} 超过已用 "
+                               f"{b['disk_used_bytes']}（容量账不平）")
+                if b["disk_used_bytes"] < -EPS:
+                    bad.append(f"盒子 {b['box_id']} 已用容量为负（重复释放）")
+            # 4. repairs: open repair ⇔ parent quarantined & active job
+            for r in s["tasks"].values():
+                if r.get("kind") != "repair":
+                    continue
+                parent = s["tasks"].get(r["parent_task_id"])
+                if parent is None:
+                    bad.append(f"修复 {r['task_id']} 没有父任务")
+                    continue
+                if r["status"] in ("queued", "transferring", "paused") and \
+                        (parent["accept_stage"] != ACCEPT_QUARANTINED
+                         or s["jobs"][r["job_id"]]["status"] != "active"):
+                    bad.append(f"修复 {r['task_id']} 仍开放但父任务未隔离/作业已终结")
+            # 5. immutable proofs: proven map entries reference existing proofs
+            pids = set(s["proofs"])
+            for b in s["boxes"].values():
+                for h, rec in b.get("proven", {}).items():
+                    pid = rec.get("proof_id")
+                    if pid and pid not in pids:
+                        bad.append(f"盒子 {b['box_id']} 对象 {short(h)} 引用不存在证明 {pid}")
             return bad

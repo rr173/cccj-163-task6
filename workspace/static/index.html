@@ -222,9 +222,12 @@
       调度器按<strong>站点共享带宽 · 盒内可用空间 · 内容复用率</strong>安排传输，
       磁盘预留与传输名额<strong>成对取得/释放</strong>，欠账机制保证持续推进的作业不被饿死，
       暂停恢复只补剩余数据。空间不足、链路降级、盒子离线、取消或服务崩溃都不留幽灵占用，
-      重启后重建队列/欠账/剩余时长。本页与 <code>preheat_cli.py</code> 读写同一数据源
-      （data/preheat.json），排队次序、限速原因与预计完成时间完全一致；编排只读线上，
-      绝不影响已生效地图与行程快照。
+      重启后重建队列/欠账/剩余时长。<strong>传输完成后盒端逐项验收长度/对象散列/块散列/
+      根散列并生成不可变证明</strong>，只有证明有效的内容才计入复用并进入可切换集合；
+      缺块/损坏只隔离受影响对象、释放空间并按剩余块创建一次修复（同键并发返回首次、
+      旧代次修复不覆盖新证明）。本页与 <code>preheat_cli.py</code> 读写同一数据源
+      （data/preheat.json），排队次序、限速原因、预计完成时间与<strong>验收看板/汇总</strong>
+      完全一致；编排只读线上，绝不影响已生效地图、行程快照与镜像仓库。
     </div>
     <div class="grid2">
       <div class="panel">
@@ -277,6 +280,23 @@
       <div class="panel">
         <h2>编排事件（append-only）</h2>
         <div id="phEvents" class="events" style="max-height:420px"></div>
+      </div>
+    </div>
+    <div class="grid2 wide-left">
+      <div class="panel">
+        <h2>④ 盒端验收与隔离修复 <span class="hint">同一状态：待验收/已证明/隔离/修复中</span></h2>
+        <div class="audit-banner" style="margin:6px 0">
+          传输完成后每台盒子对清单对象逐项验证<strong>长度 · 块散列 · 根散列</strong>，
+          生成带<strong>清单代次/作业编号/验收序号</strong>的不可变证明；只有证明有效的对象
+          才计入后续复用并进入可切换集合。缺块/损坏只隔离受影响对象并释放其空间，
+          按剩余块创建<strong>一次修复</strong>（同键并发返回首次任务，旧代次修复不覆盖新证明）。
+        </div>
+        <div id="phBoardCounts" class="hint" style="margin-bottom:6px"></div>
+        <div id="phBoard" class="cardlist" style="max-height:520px"></div>
+      </div>
+      <div class="panel">
+        <h2>批量汇总 <span class="hint">按站点 × 清单：通过率 / 隔离容量 / 失败原因</span></h2>
+        <div id="phSummary" class="cardlist" style="max-height:560px"></div>
       </div>
     </div>
   </section>

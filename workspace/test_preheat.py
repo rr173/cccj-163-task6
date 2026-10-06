@@ -55,6 +55,30 @@ def expect_err(name, fn, code, status):
     return None
 
 
+def drive(ph, ticks=120, secs=1.0, accept=True):
+    """Advance the clock; every delivered (待验收) task is accepted at the box.
+
+    Models the box agent: transfer finishes → item-by-item acceptance → a
+    repair is auto-created when needed → tick until the repair converges.
+    Only PROVEN content completes, matching the acceptance gate.
+    """
+    accepted, repaired = [], []
+    for _ in range(ticks):
+        ph.tick(secs)
+        if not accept:
+            continue
+        for t in list(ph.state["tasks"].values()):
+            if t.get("kind") == "repair":
+                continue
+            if t["status"] == "transferred":
+                r = ph.accept_task(t["task_id"])
+                accepted.append((t["task_id"], r["run"]["outcome"]))
+            elif t["status"] == "quarantined":
+                ph.create_repair(t["task_id"])
+                repaired.append(t["task_id"])
+    return accepted, repaired
+
+
 def live_fp(eng):
     s = eng.state
     return json.dumps({"gen": s["region_gen"], "heads": s["region_heads"],
@@ -183,10 +207,16 @@ def main():
           f"{before['bytes_done']} → {t4['bytes_done']}")
     for _ in range(30):
         ph.tick(1.0)
+        for t in list(ph.state["tasks"].values()):
+            if t.get("kind") != "repair" and t["status"] == "transferred":
+                ph.accept_task(t["task_id"])
+            elif t.get("kind") != "repair" and t["status"] == "quarantined":
+                ph.create_repair(t["task_id"])
         if not any(t["box_id"] == "RSU-04" for t in ph.queue()["queue"]):
             break
     t4 = next(t for t in ph.queue()["inactive"] if t["box_id"] == "RSU-04")
-    check("RSU-04 任务最终完成", t4["status"] == "done")
+    check("RSU-04 任务最终证明", t4["status"] == "done"
+          and t4["accept_stage"] == "proven")
     check("不变量自检通过", ph.check_invariants() == [])
 
     print("\n[6] 链路降级 / 盒子离线：成对让路，恢复后续传")
@@ -245,10 +275,7 @@ def main():
     ph = ph2
 
     print("\n[8] 内容复用：已完成 gen1 的盒子对 gen2 只传增量")
-    for _ in range(60):
-        ph.tick(1.0)
-        if not ph.queue()["queue"]:
-            break
+    drive(ph)
     j5 = ph.create_job({"manifest_id": m2["manifest_id"],
                         "targets": ["RSU-01", "RSU-03"],
                         "deadline_in_sec": 600, "link_cap_kbps": 1.0,
@@ -261,16 +288,14 @@ def main():
                         "deadline_in_sec": 600, "link_cap_kbps": 1.0,
                         "min_online": 1})
     t6 = j6["job"]["tasks"][0]
-    check("全部对象已在盒上 → 复用率 100% 即时完成",
-          t6["reuse_ratio"] == 1.0 and t6["status"] == "done",
+    check("全部对象已证明在盒上 → 复用率 100% 即时证明",
+          t6["reuse_ratio"] == 1.0 and t6["status"] == "done"
+          and t6["accept_stage"] == "proven",
           f"reuse={t6['reuse_ratio']} status={t6['status']}")
     check("不变量自检通过", ph.check_invariants() == [])
 
     print("\n[9] 修改配额：确定性抢占；取消：判定一次终身")
-    for _ in range(60):
-        ph.tick(1.0)
-        if not ph.queue()["queue"]:
-            break
+    drive(ph)
     j7 = ph.create_job({"manifest_id": m2["manifest_id"], "targets": ["RSU-03"],
                         "deadline_in_sec": 600, "link_cap_kbps": 5.0,
                         "min_online": 1})
